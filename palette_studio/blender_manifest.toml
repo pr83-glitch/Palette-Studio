@@ -1,0 +1,33 @@
+schema_version = "1.0.0"
+
+id = "palette_studio"
+version = "1.0.0"
+name = "Palette Studio"
+tagline = "Load 900+ terminal and editor palettes as Blender UI themes"
+maintainer = "Pr83-Glitch"
+type = "add-on"
+
+tags = ["User Interface"]
+
+blender_version_min = "4.5.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+  "2025 NXSTYNATE (original Palette add-on)",
+  "2026 Pr83-Glitch (Palette Studio modifications)",
+]
+
+[permissions]
+network = "Downloads color schemes and checks for updates from GitHub repositories"
+files = "Caches themes locally and reads local update ZIP packages"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".*",
+  "*.zip",
+  "assets/",
+]

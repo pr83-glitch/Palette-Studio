@@ -1,0 +1,14 @@
+# Built release archives: attach to GitHub Releases, never commit
+ZIP Files/
+*.zip
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local-only agent / tooling files
+AGENTS.md
+.agents/
+.pi/
+Palette Studio Addon-docs.md
+Palette Studio Function Comparison.md
