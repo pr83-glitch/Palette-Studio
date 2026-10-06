@@ -17,10 +17,14 @@
 """
 Repository management for downloading and caching color scheme repos.
 
-Supports three sources:
+Supports five remote sources and one local source:
   - NvChad base46                   ~105 .lua   (on by default)
   - iTerm2-Color-Schemes            ~250 .itermcolors
   - tinted-theming base24           ~230 .yaml
+  - kovidgoyal kitty-themes         ~412 .conf
+  - alacritty/alacritty-theme       ~177 .toml
+  - Noctalia schemes                ~11 local .json (dark + light each) plus
+    noctalia-dev/community-palettes, downloaded like the other sources
 
 All sources are downloaded as zip archives and extracted to separate
 subdirectories. The index is always built from every cached source (a
@@ -29,8 +33,8 @@ themes without forcing a re-download.
 
 The same-named themes from different sources are all indexed; the
 browser distinguishes them with a per-row source tag. iTerm2 .itermcolors,
-Gogh .yml, kitty .conf, base16/base24 .yaml and base46 .lua files can
-also be loaded from a local folder.
+Gogh .yml, kitty .conf, Alacritty .toml, base16/base24 .yaml, base46 .lua and
+Noctalia .json files can also be loaded from a local folder.
 
 Sources are pinned to reviewed upstream commits (see SOURCES) so a
 download always fetches a known, reproducible snapshot. To update a
@@ -63,7 +67,12 @@ _MAX_ARCHIVE_ENTRIES = 100000
 _MAX_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_THEME_FILE_BYTES = 8 * 1024 * 1024
 _DOWNLOAD_CHUNK = 256 * 1024
-_USER_AGENT = "PaletteStudio/1.0.0 (Blender add-on)"
+_USER_AGENT = "PaletteStudio/1.1.0 (Blender add-on)"
+
+# Local Noctalia schemes and the community-palettes download are ONE source in
+# the UI ("Noctalia"), so both are indexed under this tag and a single Settings
+# toggle governs them.
+NOCTALIA_TAG = "noctalia"
 
 SOURCES = {
     "nvchad": {
@@ -86,6 +95,28 @@ SOURCES = {
         "revision": "50f6e3b93a8f62db9d839f8b79a709c1bbdaac53",
         "subdir": "base24",
         "extensions": {".yaml"},
+    },
+    "kitty": {
+        "name": "kitty-themes",
+        "repo": "kovidgoyal/kitty-themes",
+        "revision": "b95a97da1fad87263452590d74212499bd120de7",
+        "subdir": "themes",
+        "extensions": {".conf"},
+    },
+    "alacritty": {
+        "name": "alacritty-theme",
+        "repo": "alacritty/alacritty-theme",
+        "revision": "ab88d5a80d676b5dc6157e91aba8067f2078dc94",
+        "subdir": "themes",
+        "extensions": {".toml"},
+    },
+    "community_palettes": {
+        "name": "Noctalia community palettes",
+        "repo": "noctalia-dev/community-palettes",
+        "revision": "31b46f7e5af97f70bb6e46fab73ebf219a4d55ef",
+        "subdir": "",
+        "extensions": {".json"},
+        "tag": NOCTALIA_TAG,
     },
 }
 
@@ -216,18 +247,154 @@ def clear_cache():
     return removed
 
 
+# ----------------------------------------------------------------------
+# Noctalia: local schemes and the one Noctalia is currently using
+# ----------------------------------------------------------------------
+
+def _config_home():
+    """$XDG_CONFIG_HOME, or ~/.config."""
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+
+
+def get_noctalia_dir():
+    """Path of Noctalia's config directory."""
+    return os.path.join(_config_home(), "noctalia")
+
+
+def get_kitty_noctalia_path():
+    """The kitty theme Noctalia rewrites with the colours it is showing.
+
+    Noctalia regenerates this file on every palette change, INCLUDING
+    wallpaper-generated palettes - those never appear in `settings.json`, so
+    `noctalia_current_scheme()` cannot see them. That makes this file the
+    truthful source for "the Noctalia colours right now". It is plain kitty
+    syntax, so the existing kitty parser reads it unchanged.
+    """
+    return os.path.join(_config_home(), "kitty", "themes", "noctalia.conf")
+
+
+def _noctalia_scheme_paths():
+    """Paths of every local Noctalia scheme, sorted by folder name."""
+    root = os.path.join(get_noctalia_dir(), "colorschemes")
+    paths = []
+    try:
+        names = sorted(os.listdir(root), key=str.lower)
+    except OSError:
+        return paths
+    for name in names:
+        path = os.path.join(root, name, name + ".json")
+        if os.path.isfile(path):
+            paths.append(path)
+    return paths
+
+
+def noctalia_local_themes():
+    """Index entries for every local Noctalia scheme (dark and light).
+
+    No network and no cache: these are real files in the user's config, so
+    they are simply indexed alongside whatever was downloaded.
+    """
+    from .iterm_parser import noctalia_variants
+
+    entries = []
+    for path in _noctalia_scheme_paths():
+        name = os.path.basename(os.path.dirname(path))
+        for variant in noctalia_variants(path):
+            entries.append({
+                "name": "%s (%s)" % (name, variant.capitalize()),
+                "path": path,
+                "source": NOCTALIA_TAG,
+                "dark": variant == "dark",
+                "variant": variant,
+            })
+    return entries
+
+
+# ``settings.json`` is read on every Settings draw, so the answer is cached on
+# the file's mtime instead of being re-parsed.
+_noctalia_probe = {"stamp": None, "value": None}
+
+
+def _read_noctalia_current(settings):
+    """Resolve (name, variant, path) from a Noctalia settings.json."""
+    from .iterm_parser import noctalia_variants
+
+    try:
+        with open(settings, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    schemes = data.get("colorSchemes") if isinstance(data, dict) else None
+    if not isinstance(schemes, dict):
+        return None
+    name = str(schemes.get("predefinedScheme") or "").strip()
+    if not name:
+        return None
+    variant = "dark" if schemes.get("darkMode", True) else "light"
+    path = os.path.join(get_noctalia_dir(), "colorschemes", name, name + ".json")
+    if not os.path.isfile(path):
+        return None
+    present = noctalia_variants(path)
+    if not present:
+        return None
+    if variant not in present:
+        variant = present[0]
+    return (name, variant, path)
+
+
+def noctalia_current_scheme():
+    """(name, variant, path) of the scheme Noctalia uses now, else None.
+
+    Noctalia records the active scheme in ``settings.json``:
+    ``colorSchemes.predefinedScheme`` names it, ``colorSchemes.darkMode``
+    picks the variant.
+    """
+    settings = os.path.join(get_noctalia_dir(), "settings.json")
+    try:
+        stamp = os.path.getmtime(settings)
+    except OSError:
+        return None
+    if _noctalia_probe.get("stamp") != stamp:
+        _noctalia_probe["stamp"] = stamp
+        _noctalia_probe["value"] = _read_noctalia_current(settings)
+    return _noctalia_probe["value"]
+
+
+def noctalia_sync_source():
+    """What the Sync Current Theme button should pull, or None.
+
+    Returns ``("kitty", path)`` for the terminal theme Noctalia keeps up to
+    date (preferred - it reflects wallpaper-generated palettes too), else
+    ``("scheme", (name, variant, path))`` for the scheme recorded in
+    ``settings.json``, else None.
+    """
+    kitty = get_kitty_noctalia_path()
+    if os.path.isfile(kitty):
+        return ("kitty", kitty)
+    scheme = noctalia_current_scheme()
+    if scheme:
+        return ("scheme", scheme)
+    return None
+
+
 def index_local_folder(folder_path):
     """Scan a local folder for supported theme files and build an index."""
     from .iterm_parser import scan_folder_detailed
 
     themes = scan_folder_detailed(folder_path)
+    entries = [
+        {"name": t["name"], "path": t["path"], "source": "local",
+         "dark": t["dark"], "variant": t.get("variant", "")}
+        for t in themes
+    ]
+    # The local Noctalia schemes live outside the chosen folder but are local
+    # files all the same, so they stay listed in LOCAL mode too.
+    entries.extend(noctalia_local_themes())
     index = {
-        "themes": [
-            {"name": t["name"], "path": t["path"], "source": "local", "dark": t["dark"]}
-            for t in themes
-        ],
+        "themes": entries,
         "last_updated": time.time(),
-        "sources": ["local"],
+        "sources": ["local", NOCTALIA_TAG],
     }
     save_index(index)
     return index
@@ -398,17 +565,33 @@ def _scan_sources(cache_dir, source_keys):
             else:
                 continue
 
+        tag = src.get("tag", source_key)
         for entry in scan_folder_detailed(source_dir):
             # Same-named themes from different sources are all kept; the
             # source tag in the browser distinguishes them.
             all_themes.append({
                 "name": entry["name"],
                 "path": entry["path"],
-                "source": source_key,
+                "source": tag,
                 "dark": entry["dark"],
+                "variant": entry.get("variant", ""),
             })
 
         sources_done.append(source_key)
+
+    # Local Noctalia schemes need no download - they are on disk whenever
+    # Noctalia is installed. When a scheme exists both locally and in the
+    # downloaded community collection it is listed ONCE, from the local file:
+    # that is the copy Noctalia is using, and the one Sync reads.
+    local_noctalia = noctalia_local_themes()
+    if local_noctalia:
+        local_names = {e["name"].lower() for e in local_noctalia}
+        all_themes = [t for t in all_themes
+                      if t.get("source") != NOCTALIA_TAG
+                      or t["name"].lower() not in local_names]
+        all_themes.extend(local_noctalia)
+        if NOCTALIA_TAG not in sources_done:
+            sources_done.append(NOCTALIA_TAG)
 
     all_themes.sort(key=lambda t: t["name"].lower())
 

@@ -48,6 +48,27 @@ def _linear_to_srgb(c):
     return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1.0 / 2.4)) - 0.055
 
 
+def srgb_to_linear(rgb):
+    """Convert an sRGB RGB tuple (0-1) to linear light.
+
+    Needed wherever a palette value crosses into a Blender ``subtype='COLOR'``
+    property: Blender stores and edits those in linear light, while theme files,
+    hex codes and every value in the role table are sRGB. Skipping the
+    conversion makes a swatch render too light (an sRGB value displayed as if
+    it were linear).
+    """
+    return tuple(clamp(_srgb_to_linear(c)) for c in rgb[:3])
+
+
+def linear_to_srgb(rgb):
+    """Convert a linear-light RGB tuple (0-1) back to sRGB.
+
+    The inverse of :func:`srgb_to_linear`; use it when reading a
+    ``subtype='COLOR'`` property back into a hex code or a palette value.
+    """
+    return tuple(clamp(_linear_to_srgb(c)) for c in rgb[:3])
+
+
 # =========================================================================
 # Linear sRGB <-> Oklab
 # =========================================================================

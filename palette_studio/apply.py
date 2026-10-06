@@ -31,6 +31,13 @@ Comprehensive mapping covering:
 
 import traceback as _tb
 
+from . import color_math as cm
+
+
+def _srgb_from_linear_rgba(rgba):
+    """Stored linear-light RGBA (Finetune COLOR property) -> sRGB, alpha kept."""
+    return (*cm.linear_to_srgb(rgba), *tuple(rgba[3:]))
+
 
 def _set_color(obj, attr, color):
     """
@@ -85,6 +92,23 @@ def _try_set(obj, attr, value):
         setattr(obj, attr, value)
     except (AttributeError, TypeError, ValueError):
         pass
+
+
+def _rgba(color, alpha=None):
+    """Palette colour -> RGBA for a theme colour field.
+
+    Palette values are RGB, but the Palette Editor's Quick Adjust alpha
+    slider makes ANSI-derived roles carry an alpha component. That value is
+    honoured here; ``alpha`` is a role's own design alpha (``face_select``
+    at 0.35, fully transparent panels at 0.0) and multiplies with it, so the
+    intentional translucency survives instead of being overwritten. Plain
+    RGB values stay fully opaque.
+    """
+    color = tuple(float(c) for c in color)
+    base = color[3] if len(color) > 3 else 1.0
+    if alpha is not None:
+        base *= float(alpha)
+    return (color[0], color[1], color[2], base)
 
 
 def _iter_theme_structs(struct, depth=0):
@@ -204,16 +228,21 @@ def apply_theme_to_blender(palette):
         _sizes = {"edge_width": 1, "vertex_size": 3, "facedot_size": 3, "outline_width": 1}
 
     # Finetune > Dopesheet Texts: seed this palette's default channel text
-    # colors (theme text + white), then use the effective values (custom
-    # overrides win when enabled).
+    # colors (theme foreground + white), then use the effective values (custom
+    # overrides win when enabled). The properties are COLOR subtypes, so they
+    # hold linear light; theme fields take sRGB.
     if _prefs is not None:
         try:
             from . import prefs as _prefs_mod
-            _prefs_mod.seed_dope_defaults(p["ui_text"], p["white"])
+            _prefs_mod.seed_dope_defaults(p["fg"], p["white"])
         except Exception:
             pass
-    dope_text = tuple(_prefs.finetune_dope_text) if _prefs else p["ui_text"]
-    dope_text_sel = tuple(_prefs.finetune_dope_text_sel) if _prefs else p["white"]
+    if _prefs is not None:
+        dope_text = cm.linear_to_srgb(tuple(_prefs.finetune_dope_text))
+        dope_text_sel = cm.linear_to_srgb(tuple(_prefs.finetune_dope_text_sel))
+    else:
+        dope_text = p["fg"]
+        dope_text_sel = p["white"]
 
     # Finetune > Grid Color: seed the palette's default grid color, then
     # use the effective value (custom override wins when enabled).
@@ -223,7 +252,10 @@ def apply_theme_to_blender(palette):
             _prefs_mod.seed_grid_defaults((*p["grid_line"][:3], 1.0))
         except Exception:
             pass
-    grid_color = tuple(_prefs.finetune_grid) if _prefs else (*p["grid_line"], 1.0)
+    if _prefs is not None:
+        grid_color = _srgb_from_linear_rgba(tuple(_prefs.finetune_grid))
+    else:
+        grid_color = (*p["grid_line"], 1.0)
 
     # Finetune > Text Style (Themes > User Interface > Text Style): the values
     # live in user preferences (preferences.ui_styles), not in the Theme, so
@@ -249,64 +281,71 @@ def apply_theme_to_blender(palette):
 
     def set_wcol(wcol, outline, inner, inner_sel, item, text, text_sel):
         # outline, inner, inner_sel, item are RGBA float[4] in Blender
-        _set_color(wcol, 'outline', (*outline[:3], 1.0))
-        _set_color(wcol, 'inner', (*inner[:3], 1.0))
-        _set_color(wcol, 'inner_sel', (*inner_sel[:3], 1.0))
-        _set_color(wcol, 'item', (*item[:3], 1.0))
-        _set_color(wcol, 'text', (*text[:3], 1.0))
-        _set_color(wcol, 'text_sel', (*text_sel[:3], 1.0))
+        _set_color(wcol, 'outline', _rgba(outline))
+        _set_color(wcol, 'inner', _rgba(inner))
+        _set_color(wcol, 'inner_sel', _rgba(inner_sel))
+        _set_color(wcol, 'item', _rgba(item))
+        _set_color(wcol, 'text', _rgba(text))
+        _set_color(wcol, 'text_sel', _rgba(text_sel))
 
+    # Regular: Inner Selected uses the Secondary palette color.
     set_wcol(ui.wcol_regular,
-             p["widget_outline"], p["widget_bg"], p["ui_accent_func"],
+             _rgba(p["outline_color_3"], 0.3), p["widget_bg"], p["accent_secondary"],
              p["ui_accent_func"], p["widget_text"], p["ui_accent_func_text"])
 
     set_wcol(ui.wcol_tool,
-             p["widget_outline"], p["button_bg"], p["ui_accent_func"],
+             _rgba(p["outline_color_3"], 0.3), p["button_bg"], p["ui_accent_func"],
              p["ui_accent_func"], p["button_text"], p["ui_accent_func_text"])
 
-    # Toolbar item: active state only — Inner Selected = Secondary accent.
+    # Toolbar item: active state only — Inner Selected = Secondary accent;
+    # Outline uses Outline 2 at 0.3 alpha.
     set_wcol(ui.wcol_toolbar_item,
-             p["widget_outline"], p["toolbar_bg"], p["accent_secondary"],
+             _rgba(p["outline_color_2"], 0.3), p["toolbar_bg"], p["accent_secondary"],
              p["option_check"], p["toolbar_text"], p["ui_accent_func_text"])
 
     # Radio buttons: active state only — Inner Selected = Tertiary accent.
     set_wcol(ui.wcol_radio,
-             p["widget_outline"], p["widget_bg"], p["accent_tertiary"],
-             p["option_check"], p["widget_text"], p["ui_accent_func_text"])
+             _rgba(p["outline_color_2"], 0.3), p["widget_bg"], p["accent_tertiary"],
+             p["option_check"], p["widget_text"], p["ui_bg"])
 
     # Text fields: active state only — Inner Selected = Tertiary accent.
+    # Text: Inner Selected uses Tertiary at 0.3 alpha.
     set_wcol(ui.wcol_text,
-             p["input_border"], p["input_bg"], p["accent_tertiary"],
-             p["ui_text_sel_highlight"], p["input_text"], p["ui_selection_text"])
+             p["input_border"], p["input_bg"], _rgba(p["accent_tertiary"], 0.3),
+             p["ui_text_sel_highlight"], p["input_text"],
+             _rgba(p["accent_tertiary"], 0.3))
 
-    # Checkbox / Option: active state only — Inner Selected = Secondary accent,
+    # Checkbox / Option: active state only — Inner Selected = Primary accent;
+    # Outline uses Outline 3 at 0.3 alpha.
     # Item = a glyph that stays readable on it. Outline, Inner, Text and
     # Text Selected keep the theme's own values.
     set_wcol(ui.wcol_option,
-             p["widget_outline"], p["widget_bg"], p["accent_secondary"],
+             _rgba(p["outline_color_3"], 0.3), p["widget_bg"], p["accent_primary"],
              p["accent_secondary_text"], p["widget_text"], p["ui_accent_func_text"])
 
-    # Toggle: active state only — Inner Selected = Primary accent.
-    # Text Selected deliberately mirrors Tab Colors > Text Selected
-    # (wcol_toggle.text_sel == wcol_tab.text_sel, both tab_sel_text).
+    # Toggle: active state only — Inner Selected = Tertiary accent.
+    # Text Selected deliberately mirrors Tab Colors > Text Selected: both take
+    # the Background 1 surface role (p["ui_bg"]), so selected text reads
+    # against the accent fill instead of using fg.
     set_wcol(ui.wcol_toggle,
-             p["widget_outline"], p["widget_bg"], p["accent_primary"],
-             p["ui_accent_text"], p["widget_text"], p["tab_sel_text"])
+             _rgba(p["outline_color_3"], 0.3), p["widget_bg"], p["accent_tertiary"],
+             p["ui_accent_text"], p["widget_text"], p["ui_bg"])
 
     set_wcol(ui.wcol_num,
              p["input_border"], p["input_bg"], p["ui_selection"],
              p["ui_accent_func"], p["input_text"], p["ui_selection_text"])
 
+    # Value Slider: Outline 3 and Secondary item color.
     set_wcol(ui.wcol_numslider,
-             p["input_border"], p["input_bg"], p["ui_selection"],
-             p["ui_accent_func"], p["input_text"], p["ui_selection_text"])
+             p["outline_color_3"], p["input_bg"], p["ui_selection"],
+             p["accent_secondary"], p["input_text"], p["ui_selection_text"])
 
     set_wcol(ui.wcol_box,
-             p["ui_border"], p["ui_card"], p["ui_selection"],
+             _rgba(p["outline_color_3"], 0.3), p["ui_card"], p["ui_selection"],
              p["ui_accent_func"], p["widget_text"], p["ui_selection_text"])
 
     set_wcol(ui.wcol_menu,
-             p["ui_border"], p["ui_popup"], p["menu_inner_sel"],
+             _rgba(p["outline_color_3"], 0.3), p["ui_popup"], p["menu_inner_sel"],
              p["menu_accent"], p["widget_text"], p["menu_text_sel"])
 
     set_wcol(ui.wcol_pulldown,
@@ -326,21 +365,22 @@ def apply_theme_to_blender(palette):
              p["ui_accent_func"], p["widget_text"], p["ui_selection_text"])
 
     set_wcol(ui.wcol_scroll,
-             p["ui_border"], p["scroll_bg"], p["scroll_handle_hover"],
+             _rgba(p["outline_color_2"], 0.3), p["scroll_bg"], p["scroll_handle_hover"],
              p["scroll_handle"], p["widget_text"], p["widget_text"])
 
     set_wcol(ui.wcol_progress,
              p["ui_border"], p["widget_bg"], p["ui_accent_func"],
              p["ui_accent_func"], p["widget_text"], p["ui_accent_func_text"])
 
+    # List Item: Inner Selected uses the Tertiary palette color.
     set_wcol(ui.wcol_list_item,
-             p["ui_border"], p["ui_bg"], p["accent_secondary"],
-             p["ui_accent_func"], p["widget_text"], p["accent_secondary_text"])
+             _rgba(p["outline_color_3"], 0.3), p["ui_bg"], p["accent_tertiary"],
+             p["ui_accent_func"], p["widget_text"], p["ui_bg"])
 
-    # Tab: active state only — Inner Selected = Tertiary accent.
+    # Tab: active state only — Inner Selected = Primary accent.
     set_wcol(ui.wcol_tab,
-             p["tab_outline"], p["tab_inactive_bg"], p["accent_tertiary"],
-             p["ui_accent_func"], p["ui_text_muted"], p["tab_sel_text"])
+             p["tab_outline"], p["tab_inactive_bg"], p["accent_primary"],
+             p["ui_accent_func"], p["ui_text_muted"], p["ui_bg"])
 
     # wcol_pie_menu if available
     try:
@@ -352,14 +392,14 @@ def apply_theme_to_blender(palette):
 
     # --- Panel colors (global) ---
     _set_color(ui, 'panel_back', (*p["ui_panel"], 0.7))
-    _set_color(ui, 'panel_header', (*p["ui_panel_header"], 1.0))
+    _set_color(ui, 'panel_header', _rgba(p["ui_panel_header"]))
     _set_color(ui, 'panel_sub_back', (*p["ui_panel_sub"], 0.5))
-    _set_color(ui, 'panel_outline', (*p["ui_panel_outline"], 1.0))
+    _set_color(ui, 'panel_outline', p["ui_panel_outline"])
     _set_color(ui, 'panel_text', p["panel_text"])
     _set_color(ui, 'panel_title', p["panel_title"])
     apply_roundness(theme, roundness)
     # Editor borders (User Interface > Editor & Widgets) — slightly brighter bg
-    _set_color(ui, 'editor_outline', (*p["editor_border"][:3], 0.35))
+    _set_color(ui, 'editor_outline', _rgba(p["editor_border"], 0.35))
     _set_color(ui, 'editor_border', p["editor_border"])
 
     # --- Axis & gizmo ---
@@ -372,7 +412,8 @@ def apply_theme_to_blender(palette):
     _set_color(ui, 'gizmo_b', p["accent_tertiary"])
 
     # --- Widget emboss ---
-    _set_color(ui, 'widget_emboss', (0.0, 0.0, 0.0, 0.25))
+    # ANSI 0 black at low alpha (the theme's own black, not a fixed RGB).
+    _set_color(ui, 'widget_emboss', _rgba(p["black"], 0.25))
     _set_color(ui, 'widget_text_cursor', p["ui_cursor"])
 
     # --- Transparent checker ---
@@ -388,14 +429,14 @@ def apply_theme_to_blender(palette):
     # Palette Studio does not influence panel/menu shadow strength or width.
 
     # --- Icon colors ---
-    _set_color(ui, 'icon_scene', (*p["icon_scene"][:3], 1.0))
-    _set_color(ui, 'icon_collection', (*p["icon_collection"][:3], 1.0))
-    _set_color(ui, 'icon_object', (*p["icon_object"][:3], 1.0))
-    _set_color(ui, 'icon_object_data', (*p["icon_object_data"][:3], 1.0))
-    _set_color(ui, 'icon_modifier', (*p["icon_modifier"][:3], 1.0))
-    _set_color(ui, 'icon_shading', (*p["icon_shading"][:3], 1.0))
-    _set_color(ui, 'icon_folder', (*p["icon_folder"][:3], 1.0))
-    _set_color(ui, 'icon_autokey', (*p["icon_autokey"][:3], 1.0))
+    _set_color(ui, 'icon_scene', _rgba(p["icon_scene"]))
+    _set_color(ui, 'icon_collection', _rgba(p["icon_collection"]))
+    _set_color(ui, 'icon_object', _rgba(p["icon_object"]))
+    _set_color(ui, 'icon_object_data', _rgba(p["icon_object_data"]))
+    _set_color(ui, 'icon_modifier', _rgba(p["icon_modifier"]))
+    _set_color(ui, 'icon_shading', _rgba(p["icon_shading"]))
+    _set_color(ui, 'icon_folder', _rgba(p["icon_folder"]))
+    _set_color(ui, 'icon_autokey', _rgba(p["icon_autokey"]))
 
     # =====================================================================
     # COLLECTION COLORS
@@ -440,27 +481,27 @@ def apply_theme_to_blender(palette):
         _set_color(space, 'title', p["ui_text_highlight"])
         _set_color(space, 'text', p["ui_text"])
         _set_color(space, 'text_hi', p["ui_text_highlight"])
-        _set_color(space, 'header', (*p["header_bg"][:3], 1.0))
+        _set_color(space, 'header', _rgba(p["header_bg"]))
         _set_color(space, 'header_text', p["header_text"])
         _set_color(space, 'header_text_hi', p["ui_text_highlight"])
         # Button bg — MUST have alpha=1.0 or Blender won't show the tint
-        _set_color(space, 'button', (*p["button_bg"][:3], 1.0))
+        _set_color(space, 'button', _rgba(p["button_bg"]))
         _set_color(space, 'button_title', p["button_text"])
         _set_color(space, 'button_text', p["button_text"])
         _set_color(space, 'button_text_hi', p["button_text_hi"])
-        _set_color(space, 'execution_buts', (*p["button_bg"][:3], 1.0))
+        _set_color(space, 'execution_buts', _rgba(p["button_bg"]))
 
         if not _is_5:
             # 4.x per-editor properties — removed/unified in 5.0
-            _set_color(space, 'navigation_bar', (*p["ui_panel"][:3], 1.0))
-            _set_color(space, 'tab_active', (*p["tab_active_bg"][:3], 0.6))
+            _set_color(space, 'navigation_bar', _rgba(p["ui_panel"]))
+            _set_color(space, 'tab_active', _rgba(p["tab_active_bg"], 0.6))
             _set_color(space, 'tab_inactive', p["tab_inactive_bg"])
             _set_color(space, 'tab_back', p["ui_bg"])
             _set_color(space, 'tab_outline', p["tab_outline"])
             # Panel colors per-space
             try:
                 pc = space.panelcolors
-                _set_color(pc, 'header', (*p["ui_panel_header"], 1.0))
+                _set_color(pc, 'header', _rgba(p["ui_panel_header"]))
                 _set_color(pc, 'back', (*p["ui_panel"], 0.7))
                 _set_color(pc, 'sub_back', (*p["ui_panel_sub"], 0.5))
             except AttributeError:
@@ -471,24 +512,24 @@ def apply_theme_to_blender(palette):
         _set_color(space, 'title', p["ui_text_highlight"])
         _set_color(space, 'text', p["ui_text"])
         _set_color(space, 'text_hi', p["ui_text_highlight"])
-        _set_color(space, 'header', (*p["header_bg"][:3], 1.0))
+        _set_color(space, 'header', _rgba(p["header_bg"]))
         _set_color(space, 'header_text', p["header_text"])
         _set_color(space, 'header_text_hi', p["ui_text_highlight"])
-        _set_color(space, 'button', (*p["button_bg"][:3], 1.0))
+        _set_color(space, 'button', _rgba(p["button_bg"]))
         _set_color(space, 'button_title', p["button_text"])
         _set_color(space, 'button_text', p["button_text"])
         _set_color(space, 'button_text_hi', p["button_text_hi"])
-        _set_color(space, 'execution_buts', (*p["button_bg"][:3], 1.0))
+        _set_color(space, 'execution_buts', _rgba(p["button_bg"]))
 
         if not _is_5:
             # 4.x per-editor properties — removed/unified in 5.0
-            _set_color(space, 'navigation_bar', (*p["ui_panel"][:3], 1.0))
-            _set_color(space, 'tab_active', (*p["tab_active_bg"][:3], 0.6))
+            _set_color(space, 'navigation_bar', _rgba(p["ui_panel"]))
+            _set_color(space, 'tab_active', _rgba(p["tab_active_bg"], 0.6))
             _set_color(space, 'tab_inactive', p["tab_inactive_bg"])
             _set_color(space, 'tab_back', p["ui_bg"])
             _set_color(space, 'tab_outline', p["tab_outline"])
             # N-panel "Region Background" fully transparent
-            _set_color(space, 'button', (*p["ui_bg"][:3], 0.0))
+            _set_color(space, 'button', _rgba(p["ui_bg"], 0.0))
 
         # Gradients — this controls the 3D viewport canvas background
         try:
@@ -503,7 +544,7 @@ def apply_theme_to_blender(palette):
             # Panel colors per-space (removed in 5.0)
             try:
                 pc = space.panelcolors
-                _set_color(pc, 'header', (*p["ui_panel_header"], 1.0))
+                _set_color(pc, 'header', _rgba(p["ui_panel_header"]))
                 _set_color(pc, 'back', (*p["ui_panel"], 0.7))
                 _set_color(pc, 'sub_back', (*p["ui_panel_sub"], 0.5))
             except AttributeError:
@@ -624,13 +665,13 @@ def apply_theme_to_blender(palette):
     set_space_generic(theme.outliner.space)
     o = theme.outliner
     _set_color(o, 'match', p["ui_accent"])
-    _set_color(o, 'selected_highlight', p["list_highlight"])
-    _set_color(o, 'active', (*p["accent_secondary"][:3], 0.45))
-    _set_color(o, 'selected_object', (*p["obj_selected"][:3], 0.3))
-    _set_color(o, 'active_object', (*p["black"][:3], 0.5))
-    _set_color(o.space, 'text_highlight', (*p["black"][:3], 0.5))
-    _set_color(o, 'edited_object', (*p["success"][:3], 0.3))
-    _set_color(o, 'row_alternate', (*p["row_alternate"][:3], 0.5))
+    _set_color(o, 'selected_highlight', p["list_highlight"])  # palette selection
+    _set_color(o, 'active', p["list_highlight"])  # Themes > Outliner > Active Highlight
+    _set_color(o, 'selected_object', _rgba(p["obj_selected"], 0.3))
+    _set_color(o, 'active_object', _rgba(p["black"], 0.5))
+    _set_color(o.space, 'text_highlight', _rgba(p["black"], 0.5))
+    _set_color(o, 'edited_object', _rgba(p["success"], 0.3))
+    _set_color(o, 'row_alternate', _rgba(p["row_alternate"], 0.5))
 
     # =====================================================================
     # TEXT EDITOR
@@ -687,8 +728,8 @@ def apply_theme_to_blender(palette):
     # =====================================================================
     set_space_generic(theme.dopesheet_editor.space)
     de = theme.dopesheet_editor
-    # Current-frame ruler text in the header uses ANSI 0 black for readability
-    _set_color(de.space, 'header_text_hi', p["black"])
+    # Current-frame ruler text in the header uses the palette background.
+    _set_color(de.space, 'header_text_hi', p["theme_bg"])
     _set_color(de, 'grid', p["grid_line"])
     # Summary row/track uses the palette accent (all Blender versions)
     _set_color(de, 'summary', (*p["ui_accent"], chan_a))
@@ -797,8 +838,8 @@ def apply_theme_to_blender(palette):
     try:
         set_space_generic(theme.timeline.space)
         tl = theme.timeline
-        # Current-frame ruler text in the header uses ANSI 0 black for readability
-        _set_color(theme.timeline.space, 'header_text_hi', p["black"])
+        # Current-frame ruler text in the header uses the palette background.
+        _set_color(theme.timeline.space, 'header_text_hi', p["theme_bg"])
         _set_color(tl, 'grid', p["grid_line"])
         # Summary row uses the palette accent
         _set_color(tl, 'summary', (*p["ui_accent"], chan_a))
@@ -852,7 +893,7 @@ def apply_theme_to_blender(palette):
     # =====================================================================
     set_space_generic(theme.file_browser.space)
     _set_color(theme.file_browser, 'selected_file', p["ui_selection"])
-    _set_color(theme.file_browser, 'row_alternate', (*p["row_alternate"][:3], 0.5))
+    _set_color(theme.file_browser, 'row_alternate', _rgba(p["row_alternate"], 0.5))
 
     # =====================================================================
     # TOPBAR
@@ -872,7 +913,7 @@ def apply_theme_to_blender(palette):
     # =====================================================================
     try:
         set_space_generic(theme.spreadsheet.space)
-        _set_color(theme.spreadsheet, 'row_alternate', (*p["row_alternate"][:3], 0.5))
+        _set_color(theme.spreadsheet, 'row_alternate', _rgba(p["row_alternate"], 0.5))
     except AttributeError:
         pass
 
@@ -926,7 +967,7 @@ def apply_theme_to_blender(palette):
     _set_color(se, 'text_strip', (*p["ui_text"], 0.5))
     _set_color(se, 'active_strip', (*p["obj_active"], 0.5))
     _set_color(se, 'selected_strip', (*p["obj_selected"], 0.5))
-    _set_color(se, 'row_alternate', (*p["row_alternate"][:3], 0.5))
+    _set_color(se, 'row_alternate', _rgba(p["row_alternate"], 0.5))
     _set_color(se, 'window_sliders', p["ui_accent"])
 
     if not _is_5:
@@ -968,7 +1009,7 @@ def apply_theme_to_blender(palette):
     if _is_5:
         # --- Regions: Sidebars ---
         sb = theme.regions.sidebars
-        _set_color(sb, 'back', (*p["ui_bg"][:3], 0.0))  # N-panel fully transparent
+        _set_color(sb, 'back', _rgba(p["ui_bg"], 0.0))  # N-panel fully transparent
         _set_color(sb, 'tab_back', p["ui_bg"])
 
         # --- Regions: Channels ---
@@ -994,8 +1035,10 @@ def apply_theme_to_blender(palette):
         _set_color(anim, 'playhead', p["playhead_color"])
         _set_color(anim, 'summary', (*p["ui_accent"], chan_a))
         _set_color(anim, 'preview_range', (*p["ui_accent"], 0.3))
-        _set_color(anim, 'channels', (*p["ui_panel"], 0.5))
-        _set_color(anim, 'channels_sub', (*p["ui_card"], 0.5))
+        # Common > Animation: use the palette's exact cyan pair for the
+        # Channels and Sub-channels fields (no synthesized alpha/shade).
+        _set_color(anim, 'channels', p["cyan"])
+        _set_color(anim, 'channels_sub', p["bright_cyan"])
         _set_color(anim, 'channel_group', (*p["accent_tertiary"], chan_a))
         _set_color(anim, 'channel_group_active', (*p["ui_accent"], chan_a))
         _set_color(anim, 'channel', p["ui_panel"])
@@ -1034,8 +1077,8 @@ def apply_theme_to_blender(palette):
         # --- User Interface: 5.0 panel properties ---
         # (panel_back, panel_header, panel_sub_back already set above
         #  in the shared UI section — these are the NEW 5.0 properties)
-        _set_color(ui, 'panel_active', (*p["ui_accent"][:3], 0.15))
-        _set_color(ui, 'panel_outline', (*p["ui_panel_outline"][:3], 0.5))
+        _set_color(ui, 'panel_active', _rgba(p["ui_accent"], 0.15))
+        _set_color(ui, 'panel_outline', p["ui_panel_outline"])
         _set_color(ui, 'editor_outline_active', p["ui_accent"])
 
     # =====================================================================
@@ -1047,11 +1090,12 @@ def apply_theme_to_blender(palette):
         try:
             from . import prefs as _prefs_mod
             _prefs_mod.seed_global_text_defaults(p["ui_text"], p["white"])
+            _prefs_mod.seed_bg_role_defaults(p.get("theme_bg"), p["ui_bg"])
         except Exception:
             pass
-        text_override = (tuple(_prefs.finetune_text)
+        text_override = (cm.linear_to_srgb(tuple(_prefs.finetune_text))
                          if getattr(_prefs, "finetune_text_custom", False) else None)
-        sel_override = (tuple(_prefs.finetune_text_sel)
+        sel_override = (cm.linear_to_srgb(tuple(_prefs.finetune_text_sel))
                         if getattr(_prefs, "finetune_text_sel_custom", False) else None)
         if text_override is not None or sel_override is not None:
             try:

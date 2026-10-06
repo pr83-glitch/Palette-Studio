@@ -20,7 +20,7 @@ Palette slot definitions.
 Kept in a standalone module (no bpy imports) so both ``__init__.py`` and
 ``prefs.py`` can import it while their own module is still being initialized.
 
-IMPORTANT: the accent/swap dropdowns build their enum items from this list
+IMPORTANT: the accent dropdowns build their enum items from this list
 statically. Blender rejects ``EnumProperty(default=...)`` when ``items`` is a
 callback function, so these must never be handed to Blender as a function.
 """
@@ -32,7 +32,7 @@ PALETTE_SLOTS = [
     ("ansi_1",  "ANSI 1 — Red"),
     ("ansi_2",  "ANSI 2 — Green"),
     ("ansi_3",  "ANSI 3 — Yellow"),
-    ("ansi_4",  "ANSI 4 — Blue / Accent"),
+    ("ansi_4",  "ANSI 4 — Blue"),
     ("ansi_5",  "ANSI 5 — Magenta"),
     ("ansi_6",  "ANSI 6 — Cyan"),
     ("ansi_7",  "ANSI 7 — White"),

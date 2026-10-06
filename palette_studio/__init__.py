@@ -19,8 +19,9 @@ Palette for Blender
 ================================
 
 Import terminal color schemes (.itermcolors, Gogh/base16 YAML, kitty .conf)
-and apply them as Blender themes. Maps ANSI terminal colors into Blender's
-UI color surface via HSL/HSV derivation.
+and apply them as Blender themes. Each Blender theme colour is an exact colour
+from the source palette (the 16 ANSI slots plus bg/fg/cursor/selection); the
+role -> slot mapping lives in ``color_roles.ROLE_MAP``.
 
 Author: NXSTYNATE
 License: GPL-3.0
@@ -29,6 +30,7 @@ License: GPL-3.0
 _needs_reload = "bpy" in locals()
 
 import bpy
+import colorsys
 import json
 import os
 import traceback
@@ -37,7 +39,7 @@ from bpy.props import (
     IntProperty,
     BoolProperty,
     CollectionProperty,
-    EnumProperty,
+    FloatProperty,
     FloatVectorProperty,
 )
 from bpy.types import (
@@ -49,6 +51,7 @@ from bpy.types import (
 
 from . import (
     color_math,
+    color_roles,
     iterm_parser,
     blender_theme_map,
     apply,
@@ -56,12 +59,12 @@ from . import (
     popular,
     prefs,
     palette_slots,
-    updater,
 )
 
 if _needs_reload:
     import importlib
     color_math = importlib.reload(color_math)
+    color_roles = importlib.reload(color_roles)
     iterm_parser = importlib.reload(iterm_parser)
     blender_theme_map = importlib.reload(blender_theme_map)
     apply = importlib.reload(apply)
@@ -69,7 +72,6 @@ if _needs_reload:
     popular = importlib.reload(popular)
     prefs = importlib.reload(prefs)
     palette_slots = importlib.reload(palette_slots)
-    updater = importlib.reload(updater)
 
 
 # =========================================================================
@@ -79,25 +81,26 @@ if _needs_reload:
 # Defined in palette_slots.py so prefs.py can import them without a cycle.
 PALETTE_SLOTS = palette_slots.PALETTE_SLOTS
 
-# Static enum items for the swap dropdowns. Blender rejects EnumProperty
-# default=... when items is a callback, so this must stay a plain list.
-_PALETTE_SLOT_ITEMS = palette_slots.ENUM_ITEMS
-
 # Friendly display names for the source key stored on each indexed theme.
 _SOURCE_LABELS = {
     "nvchad": "NvChad",
     "iterm": "iTerm2",
     "base24": "base24",
+    "kitty": "kitty",
+    "alacritty": "Alacritty",
+    "noctalia": "Noctalia",
     "base16": "base16",
     "local": "Local",
 }
 
 
 def _hex_from_rgb(r, g, b):
+    # round() rather than truncation: a truncation turns 1.0 into 0xFE, so
+    # pure white/black in a theme showed up as #FEFEFE / #010101.
     return "#{:02X}{:02X}{:02X}".format(
-        max(0, min(255, int(r * 255))),
-        max(0, min(255, int(g * 255))),
-        max(0, min(255, int(b * 255))),
+        max(0, min(255, int(round(r * 255)))),
+        max(0, min(255, int(round(g * 255)))),
+        max(0, min(255, int(round(b * 255)))),
     )
 
 
@@ -125,24 +128,102 @@ class PALETTE_STUDIO_ThemeItem(PropertyGroup):
     source: StringProperty(name="Source")
     favorite: BoolProperty(name="Favourite", default=False)
     dark: BoolProperty(name="Dark Theme", default=True)
+    # Noctalia packs a dark and a light palette into one file, so the entry
+    # remembers which one it stands for (empty for every other format).
+    variant: StringProperty(name="Variant")
+
+
+# Live apply debounce: a colour-wheel drag fires an update per mouse move, so
+# the re-apply is coalesced through a one-shot timer instead of rewriting the
+# whole theme on every tick.
+_live_apply_timer = None
+
+
+def _schedule_live_apply():
+    """Queue one live re-apply of the loaded palette."""
+    global _live_apply_timer
+    if _live_apply_timer is None:
+        try:
+            _live_apply_timer = bpy.app.timers.register(
+                _run_live_apply, first_interval=0.05)
+        except Exception:
+            _live_apply_timer = None
+
+
+def _run_live_apply():
+    """One-shot timer body: apply once, then let the next edit schedule again."""
+    global _live_apply_timer
+    _live_apply_timer = None
+    try:
+        from . import prefs
+        prefs._reapply_loaded_palette(bpy.context)
+    except Exception:
+        pass
+    return None
+
+
+def cancel_live_apply():
+    """Drop a pending live apply (called from unregister)."""
+    global _live_apply_timer
+    if _live_apply_timer is not None:
+        try:
+            bpy.app.timers.unregister(_live_apply_timer)
+        except Exception:
+            pass
+        _live_apply_timer = None
+
+
+def _maybe_live_apply(context):
+    """Schedule a live re-apply when a palette is loaded in the editor.
+
+    Palette Editor edits always apply live, like Finetune; the Settings
+    "Preview" toggle only governs theme-list browsing. During
+    ``_populate_palette_from_theme`` the loaded flag is still False, so the
+    programmatic writes there never queue an apply.
+    """
+    try:
+        wm = context.window_manager
+        if not wm.palette_studio_palette_loaded or not len(wm.palette_studio_palette):
+            return
+    except Exception:
+        return
+    _schedule_live_apply()
 
 
 def _on_palette_hex_update(self, context):
-    """When hex field is edited, update the color swatch."""
+    """When hex field is edited, update the color swatch.
+
+    ``hex_value`` is sRGB text, while ``color`` is a ``subtype='COLOR'``
+    property, which Blender stores in linear light. Convert on the way in,
+    otherwise the swatch drifts lighter than the hex it is supposed to show.
+    """
     rgb = _rgb_from_hex(self.hex_value)
     if rgb:
+        linear = color_math.srgb_to_linear(rgb)
         # Prevent recursive update
-        if (abs(self.color[0] - rgb[0]) > 0.002
-                or abs(self.color[1] - rgb[1]) > 0.002
-                or abs(self.color[2] - rgb[2]) > 0.002):
-            self.color = rgb
+        if (abs(self.color[0] - linear[0]) > 0.002
+                or abs(self.color[1] - linear[1]) > 0.002
+                or abs(self.color[2] - linear[2]) > 0.002):
+            self.color = linear
+    _maybe_live_apply(context)
 
 
 def _on_palette_color_update(self, context):
-    """When color swatch is edited, update the hex field."""
-    new_hex = _hex_from_rgb(*self.color)
+    """When color swatch is edited, update the hex field and apply live."""
+    new_hex = _hex_from_rgb(*color_math.linear_to_srgb(self.color))
     if self.hex_value != new_hex:
         self.hex_value = new_hex
+    _maybe_live_apply(context)
+
+
+def _on_palette_slot_enabled_update(self, context):
+    """Quick Adjust checkbox: live-apply (the base colour is untouched)."""
+    _maybe_live_apply(context)
+
+
+def _on_quick_adjust_update(self, context):
+    """Quick Adjust sliders: live-apply (debounced)."""
+    _maybe_live_apply(context)
 
 
 class PALETTE_STUDIO_PaletteColor(PropertyGroup):
@@ -163,6 +244,13 @@ class PALETTE_STUDIO_PaletteColor(PropertyGroup):
         maxlen=7,
         update=_on_palette_hex_update,
     )
+    # Quick Adjust skips unchecked ANSI slots; their swatch stays editable.
+    enabled: BoolProperty(
+        name="Enabled",
+        description="Include this ANSI slot in the Quick Adjust sliders",
+        default=True,
+        update=_on_palette_slot_enabled_update,
+    )
     # Store original color for reset
     orig_r: bpy.props.FloatProperty(default=0.5)
     orig_g: bpy.props.FloatProperty(default=0.5)
@@ -175,6 +263,9 @@ class PALETTE_STUDIO_PaletteColor(PropertyGroup):
 
 def _populate_palette_from_theme(wm, palette_theme):
     """Fill the editable palette collection from a parsed iTerm theme."""
+    # Cleared first: the live-apply callbacks stay inert while the collection
+    # is being rebuilt (see _maybe_live_apply).
+    wm.palette_studio_palette_loaded = False
     wm.palette_studio_palette.clear()
 
     ansi = palette_theme.get("ansi", [])
@@ -206,11 +297,22 @@ def _populate_palette_from_theme(wm, palette_theme):
                 else:
                     c = (0.5, 0.5, 0.5)
 
-        item.color = c[:3]
+        # ``color`` is a subtype='COLOR' property, so Blender holds it in
+        # linear light; the parsed theme and ``hex_value`` are sRGB. Convert on
+        # the way in or the swatch renders lighter than the hex code.
+        linear = color_math.srgb_to_linear(c[:3])
+        item.color = linear
         item.hex_value = _hex_from_rgb(*c[:3])
-        item.orig_r = c[0]
-        item.orig_g = c[1]
-        item.orig_b = c[2]
+        item.orig_r = linear[0]
+        item.orig_g = linear[1]
+        item.orig_b = linear[2]
+        item.enabled = True
+
+    # Quick Adjust starts neutral for every newly loaded palette.
+    wm.palette_quick_hue = 0.5
+    wm.palette_quick_sat = 1.0
+    wm.palette_quick_val = 1.0
+    wm.palette_quick_alpha = 1.0
 
     wm.palette_studio_palette_loaded = True
     wm.palette_studio_palette_theme_name = palette_theme.get("name", "Unknown")
@@ -230,7 +332,11 @@ _FINETUNE_COLOR_PROPS = (
 
 def _slot_color(theme, slot_id):
     """Resolve a palette slot id ("ansi_3", "selection", …) to RGB in a
-    normalized theme dict. Returns None when the slot is missing/empty."""
+    normalized theme dict. Returns None when the slot is missing/empty.
+
+    A slot carrying Quick Adjust alpha comes back as RGBA, so an accent or
+    Finetune pick pointing at it inherits that alpha.
+    """
     if not slot_id:
         return None
     if slot_id.startswith("ansi_"):
@@ -240,21 +346,87 @@ def _slot_color(theme, slot_id):
             return None
         ansi = theme.get("ansi") or []
         if 0 <= idx < len(ansi) and ansi[idx]:
-            return tuple(ansi[idx][:3])
+            color = ansi[idx]
+            return tuple(color[:4]) if len(color) > 3 else tuple(color[:3])
         return None
     color = theme.get(slot_id)
     if color:
-        return tuple(color[:3])
+        return tuple(color[:4]) if len(color) > 3 else tuple(color[:3])
     return None
 
 
-def _apply_accent_overrides(theme, addon_prefs, reset_axes=True):
-    """Copy the user's slot selections into a normalized theme dict.
+def _palette_slot_enabled(wm, slot_id):
+    """Quick Adjust checkbox state for one slot (missing slot = excluded)."""
+    try:
+        for item in wm.palette_studio_palette:
+            if item.slot_id == slot_id:
+                return bool(item.enabled)
+    except Exception:
+        pass
+    return False
 
-    Covers the three accent roles and the Finetune palette colours (Playhead,
-    Axis X/Y/Z). Every dropdown picks *which palette slot* supplies the colour,
-    so it is resolved against whatever theme is being applied. Missing slots are
-    left for build_palette() to fall back on.
+
+def _apply_quick_adjust(theme, wm):
+    """Apply the Palette Editor's Quick Adjust sliders to ANSI 0-15.
+
+    Hue is a position on the hue circle, exactly like Blender's own hue slider:
+    0.5 is neutral and 0/1 wrap around. Saturation and value are multipliers
+    where 1.0 is neutral. Alpha is written as the slot's alpha. Only checked
+    slots are touched, and every value is recomputed from the slot's untouched
+    base colour, so the sliders are non-destructive: at their defaults this
+    returns the theme unchanged and the palette is byte-identical to a plain
+    apply. bg/fg/cursor/selection are never touched.
+
+    Alpha is only added to a tuple when it is actually below 1, so the default
+    path keeps the plain RGB values the rest of the pipeline expects.
+    """
+    try:
+        hue = float(wm.palette_quick_hue)
+        sat = float(wm.palette_quick_sat)
+        val = float(wm.palette_quick_val)
+        alpha = float(wm.palette_quick_alpha)
+    except (AttributeError, TypeError):
+        return theme
+
+    hue_shift = hue - 0.5
+    neutral = (abs(hue_shift) < 1e-9
+               and abs(sat - 1.0) < 1e-9
+               and abs(val - 1.0) < 1e-9)
+    alpha_on = abs(alpha - 1.0) > 1e-6
+    if neutral and not alpha_on:
+        return theme
+
+    ansi = list(theme.get("ansi") or ())
+    for i in range(min(16, len(ansi))):
+        color = ansi[i]
+        if not color:
+            continue
+        if not _palette_slot_enabled(wm, "ansi_%d" % i):
+            continue
+
+        r, g, b = color[:3]
+        if not neutral:
+            h, s, v = colorsys.rgb_to_hsv(r, g, b)
+            h = (h + hue_shift) % 1.0
+            s = min(1.0, max(0.0, s * sat))
+            v = min(1.0, max(0.0, v * val))
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+
+        ansi[i] = (r, g, b, alpha) if alpha_on else (r, g, b)
+
+    theme["ansi"] = ansi
+    return theme
+
+
+def _apply_accent_overrides(theme, addon_prefs, reset_axes=True):
+    """Copy the user's colour choices into a normalized theme dict.
+
+    Covers the three accent roles, the three Outline roles, the Background 1/2
+    surface overrides and the Finetune palette colours (Playhead, Axis X/Y/Z).
+    The dropdown roles pick *which palette slot* supplies the colour, so they
+    are resolved against whatever theme is being applied; the two background
+    roles carry a literal colour instead. Missing slots are left for
+    build_palette() to fall back on.
 
     When ``reset_axes`` is set (any palette/theme apply), the axis dropdowns are
     written back to their ANSI defaults first — an axis pick is a per-palette
@@ -269,10 +441,25 @@ def _apply_accent_overrides(theme, addon_prefs, reset_axes=True):
             _prefs_mod.reset_axis_colors(addon_prefs)
         except Exception:
             pass
-    for role in ("accent_primary", "accent_secondary", "accent_tertiary"):
+    for role in ("accent_primary", "accent_secondary", "accent_tertiary",
+                 "outline_color", "outline_color_2", "outline_color_3"):
         color = _slot_color(theme, getattr(addon_prefs, role, None))
         if color:
             theme[role] = color
+    # Background 1 / 2 are direct colour overrides (Finetune toggle + swatch)
+    # rather than slot picks. Their properties hold LINEAR light while the theme
+    # dict and apply.py work in sRGB. Nothing is written while a toggle is off,
+    # so color_roles.SLOT_CHAINS supplies the palette background instead
+    # (Background 2 falls back to Background 1, then to the background).
+    try:
+        from . import prefs as _prefs_mod
+        for role in ("bg_primary", "bg_secondary"):
+            if not getattr(addon_prefs, "finetune_%s_custom" % role, False):
+                continue
+            rgba = getattr(_prefs_mod, "_effective_%s" % role)(addon_prefs)
+            theme[role] = (*color_math.linear_to_srgb(rgba[:3]), rgba[3])
+    except Exception:
+        pass
     # Finetune colours may point at an accent role, so this runs after the
     # accent loop above has filled them in.
     for key, prop in _FINETUNE_COLOR_PROPS:
@@ -289,10 +476,11 @@ def _build_theme_from_palette(wm, addon_prefs=None, reset_axes=True):
         "ansi": [],
     }
 
-    # Build a lookup
+    # Build a lookup. ``item.color`` is linear light (COLOR subtype), the
+    # theme dict expects sRGB.
     palette_map = {}
     for item in wm.palette_studio_palette:
-        palette_map[item.slot_id] = tuple(item.color)
+        palette_map[item.slot_id] = color_math.linear_to_srgb(item.color)
 
     # ANSI 0-15
     for i in range(16):
@@ -309,6 +497,10 @@ def _build_theme_from_palette(wm, addon_prefs=None, reset_axes=True):
     theme["cursor_text"] = None
     theme["selected_text"] = None
     theme["bold"] = None
+
+    # Quick Adjust rewrites the ANSI colours; the accent roles and Finetune
+    # picks resolve afterwards so they follow the adjusted values.
+    theme = _apply_quick_adjust(theme, wm)
 
     return _apply_accent_overrides(theme, addon_prefs, reset_axes)
 
@@ -364,67 +556,6 @@ class PALETTE_STUDIO_OT_refresh_repo(Operator):
         return {'FINISHED'}
 
 
-class PALETTE_STUDIO_OT_check_updates(Operator):
-    """Check for a newer Palette Studio release and install it in place"""
-    bl_idname = "palette_studio.check_updates"
-    bl_label = "Check for Updates"
-    bl_options = {'INTERNAL'}
-
-    current_version: StringProperty(default="")
-    new_version: StringProperty(default="")
-    zip_path: StringProperty(default="")
-
-    def invoke(self, context, event):
-        from . import updater
-
-        try:
-            result = updater.check_for_update(context)
-        except NotImplementedError as e:
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-        except Exception as e:
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-
-        if not result.get("available"):
-            self.report({'INFO'}, result.get("message", "Palette Studio is up to date."))
-            return {'CANCELLED'}
-
-        self.current_version = result.get("current", "")
-        self.new_version = result.get("latest", "")
-        self.zip_path = result.get("path", "")
-        return context.window_manager.invoke_props_dialog(self, width=440)
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(
-            text=f"Update available: {self.current_version} → {self.new_version}",
-            icon='IMPORT',
-        )
-        layout.separator()
-        layout.label(text="Install the update now?")
-        layout.label(text="Palette Studio will reload in place; Blender stays open.", icon='INFO')
-        layout.separator()
-        col = layout.column()
-        col.enabled = False
-        col.label(text=self.zip_path)
-
-    def execute(self, context):
-        from . import updater
-
-        try:
-            updater.queue_install(self.zip_path)
-        except Exception as e:
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-
-        self.report(
-            {'INFO'},
-            f"Installing Palette Studio {self.new_version}…",
-        )
-        return {'FINISHED'}
-
-
 class PALETTE_STUDIO_OT_unload_themes(Operator):
     """Unload the theme list and delete downloaded theme files"""
     bl_idname = "palette_studio.unload_themes"
@@ -455,48 +586,6 @@ class PALETTE_STUDIO_OT_unload_themes(Operator):
         return {'FINISHED'}
 
 
-class PALETTE_STUDIO_OT_apply_theme(Operator):
-    """Apply the selected iTerm2 theme to Blender (one-click)"""
-    bl_idname = "palette_studio.apply_theme"
-    bl_label = "Apply Theme"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    theme_index: IntProperty(default=-1)
-
-    def execute(self, context):
-        from . import iterm_parser, blender_theme_map, apply
-
-        wm = context.window_manager
-
-        idx = self.theme_index if self.theme_index >= 0 else wm.palette_studio_theme_active
-        if idx < 0 or idx >= len(wm.palette_studio_themes):
-            self.report({'ERROR'}, "No theme selected")
-            return {'CANCELLED'}
-
-        theme_item = wm.palette_studio_themes[idx]
-
-        try:
-            palette_theme = iterm_parser.parse_theme_file(theme_item.path)
-            _apply_accent_overrides(
-                palette_theme, context.preferences.addons[__package__].preferences)
-            palette = blender_theme_map.build_palette(palette_theme)
-            result = apply.apply_theme_to_blender(palette)
-            if result is not True:
-                self.report({'WARNING'}, f"Apply issue: {result}")
-
-            # Also populate the palette editor
-            _populate_palette_from_theme(wm, palette_theme)
-
-            self.report({'INFO'}, f"Applied theme: {theme_item.name}")
-
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to apply theme: {e}")
-            traceback.print_exc()
-            return {'CANCELLED'}
-
-        return {'FINISHED'}
-
-
 class PALETTE_STUDIO_OT_load_palette(Operator):
     """Load the selected theme into the palette editor for customization"""
     bl_idname = "palette_studio.load_palette"
@@ -515,44 +604,12 @@ class PALETTE_STUDIO_OT_load_palette(Operator):
         theme_item = wm.palette_studio_themes[idx]
 
         try:
-            palette_theme = iterm_parser.parse_theme_file(theme_item.path)
+            palette_theme = iterm_parser.parse_theme_file(
+                theme_item.path, theme_item.variant)
             _populate_palette_from_theme(wm, palette_theme)
             self.report({'INFO'}, f"Loaded palette: {theme_item.name}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to load: {e}")
-            traceback.print_exc()
-            return {'CANCELLED'}
-
-        return {'FINISHED'}
-
-
-class PALETTE_STUDIO_OT_apply_custom_palette(Operator):
-    """Apply the customized palette to Blender"""
-    bl_idname = "palette_studio.apply_custom"
-    bl_label = "Apply Custom Palette"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        from . import blender_theme_map, apply
-
-        wm = context.window_manager
-
-        if not wm.palette_studio_palette_loaded or len(wm.palette_studio_palette) == 0:
-            self.report({'ERROR'}, "No palette loaded. Load a theme first.")
-            return {'CANCELLED'}
-
-        try:
-            palette_theme = _build_theme_from_palette(
-                wm, context.preferences.addons[__package__].preferences)
-            palette = blender_theme_map.build_palette(palette_theme)
-            result = apply.apply_theme_to_blender(palette)
-            if result is not True:
-                self.report({'WARNING'}, f"Apply issue: {result}")
-
-            self.report({'INFO'}, "Applied custom palette")
-
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to apply: {e}")
             traceback.print_exc()
             return {'CANCELLED'}
 
@@ -591,11 +648,14 @@ class PALETTE_STUDIO_OT_save_theme(Operator):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "theme_name")
+        layout.label(text="Save Palette Preset", icon='FILE_TICK')
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, "theme_name", text="Name")
         if not self.confirm_flow and _theme_preset_path(self.theme_name):
-            layout.separator()
-            layout.label(text="A theme with this name already exists.", icon='ERROR')
-            layout.label(text="It will be overwritten.")
+            box = layout.box()
+            box.label(text="This preset name already exists.", icon='ERROR')
+            box.label(text="Continue to confirm overwrite.")
 
     def invoke(self, context, event):
         if self.confirm_flow:
@@ -682,43 +742,23 @@ class PALETTE_STUDIO_OT_reset_palette(Operator):
         wm = context.window_manager
         for item in wm.palette_studio_palette:
             item.color = (item.orig_r, item.orig_g, item.orig_b)
-            item.hex_value = _hex_from_rgb(item.orig_r, item.orig_g, item.orig_b)
+            item.hex_value = _hex_from_rgb(
+                *color_math.linear_to_srgb((item.orig_r, item.orig_g, item.orig_b))
+            )
+            item.enabled = True
+
+        # Quick Adjust back to neutral. These writes queue one debounced live
+        # re-apply (see _maybe_live_apply), which is what makes the reset
+        # visible now that there is no Apply button.
+        wm.palette_quick_hue = 0.5
+        wm.palette_quick_sat = 1.0
+        wm.palette_quick_val = 1.0
+        wm.palette_quick_alpha = 1.0
+
+        # The interface scale goes back to the value Blender had on load.
+        prefs.restore_ui_scale_default()
 
         self.report({'INFO'}, "Palette reset to original")
-        return {'FINISHED'}
-
-
-class PALETTE_STUDIO_OT_swap_colors(Operator):
-    """Swap two selected palette colors"""
-    bl_idname = "palette_studio.swap_colors"
-    bl_label = "Swap Colors"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        wm = context.window_manager
-        a = wm.palette_studio_palette_swap_a
-        b = wm.palette_studio_palette_swap_b
-
-        if a == b:
-            self.report({'WARNING'}, "Select two different slots to swap")
-            return {'CANCELLED'}
-
-        pal = wm.palette_studio_palette
-        ia = next((i for i, it in enumerate(pal) if it.slot_id == a), -1)
-        ib = next((i for i, it in enumerate(pal) if it.slot_id == b), -1)
-        if ia < 0 or ib < 0:
-            self.report({'ERROR'}, "Selected slots are not in the loaded palette")
-            return {'CANCELLED'}
-
-        # Swap color values (not labels/slot_ids)
-        ca = tuple(pal[ia].color)
-        cb = tuple(pal[ib].color)
-        pal[ia].color = cb
-        pal[ib].color = ca
-        pal[ia].hex_value = _hex_from_rgb(*cb)
-        pal[ib].hex_value = _hex_from_rgb(*ca)
-
-        self.report({'INFO'}, f"Swapped {pal[ia].label} ↔ {pal[ib].label}")
         return {'FINISHED'}
 
 
@@ -763,7 +803,8 @@ class PALETTE_STUDIO_OT_preview_swatches(Operator):
         theme_item = wm.palette_studio_themes[idx]
 
         try:
-            palette_theme = iterm_parser.parse_theme_file(theme_item.path)
+            palette_theme = iterm_parser.parse_theme_file(
+                theme_item.path, theme_item.variant)
             _apply_accent_overrides(palette_theme, context.preferences.addons[__package__].preferences)
             palette = blender_theme_map.build_palette(palette_theme)
             summary = blender_theme_map.palette_summary(palette)
@@ -786,6 +827,50 @@ class PALETTE_STUDIO_OT_preview_swatches(Operator):
 
 
 # =========================================================================
+
+class PALETTE_STUDIO_OT_sync_noctalia(Operator):
+    """Load the color scheme Noctalia is using right now"""
+
+    bl_idname = "palette_studio.sync_noctalia"
+    bl_label = "Sync Current Theme"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        from . import repo, iterm_parser, blender_theme_map, apply
+
+        found = repo.noctalia_sync_source()
+        if not found:
+            self.report(
+                {'WARNING'},
+                "No Noctalia theme found (is Noctalia installed?)")
+            return {'CANCELLED'}
+
+        kind, payload = found
+        try:
+            if kind == "kitty":
+                # The terminal theme Noctalia rewrites on every palette change.
+                # Plain kitty syntax, and the only source that also reflects
+                # wallpaper-generated palettes.
+                palette_theme = iterm_parser.parse_theme_file(payload)
+                palette_theme["name"] = "Noctalia"
+            else:
+                name, variant, path = payload
+                palette_theme = iterm_parser.parse_theme_file(path, variant)
+                palette_theme["name"] = "%s (%s)" % (name, variant.capitalize())
+            addon_prefs = context.preferences.addons[__package__].preferences
+            _apply_accent_overrides(palette_theme, addon_prefs)
+            palette = blender_theme_map.build_palette(palette_theme)
+            apply.apply_theme_to_blender(palette)
+            # Same order as picking a theme in the browser: apply first, then
+            # refill the Palette Editor so both show the same colours.
+            _populate_palette_from_theme(context.window_manager, palette_theme)
+        except Exception as e:  # noqa: BLE001 - report anything, never crash
+            self.report({'ERROR'}, f"Sync failed: {e}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Synced Noctalia theme ({kind})")
+        return {'FINISHED'}
+
 
 class PALETTE_STUDIO_OT_toggle_favourite(Operator):
     """Toggle the selected palette's persistent favourite state."""
@@ -831,20 +916,13 @@ class PALETTE_STUDIO_UL_theme_list(UIList):
         if self.layout_type == 'GRID':
             layout.label(text="", icon='COLOR')
             return
-        row = layout.row(align=True)
-        split = row.split(factor=0.72)
+        # Keep names readable at sidebar widths. Full source metadata lives
+        # in the selected-palette card rather than competing with every name.
+        split = layout.split(factor=0.80)
         split.label(text=item.name, icon='SOLO_ON' if item.favorite else 'COLOR')
-        tag = split.row(align=True)
+        tag = split.row()
         tag.alignment = 'RIGHT'
-
-        source_label = _SOURCE_LABELS.get(item.source, item.source)
-        if source_label:
-            # Disabled child rows render in the theme's dimmed text color.
-            src = tag.row(align=True)
-            src.enabled = False
-            src.label(text=f"({source_label})")
-            tag.separator()
-
+        tag.enabled = False
         tag.label(text="Dark" if item.dark else "Light")
 
 
@@ -854,7 +932,7 @@ class PALETTE_STUDIO_UL_theme_list(UIList):
 
 class PALETTE_STUDIO_PT_sidebar(Panel):
     bl_idname = "PALETTE_STUDIO_PT_sidebar"
-    bl_label = "Palettes"
+    bl_label = "Palette Studio"
     bl_category = "Palette Studio"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -863,20 +941,7 @@ class PALETTE_STUDIO_PT_sidebar(Panel):
         layout = self.layout
         addon_prefs = context.preferences.addons[__package__].preferences
 
-        # Native Themes — same controls as Preferences > Themes
-        layout.label(text="Native Themes", icon='WORLD')
-        theme = context.preferences.themes[0]
-        row = layout.row(align=True)
-        row.menu(
-            "USERPREF_MT_interface_theme_presets",
-            text=bpy.path.display_name(os.path.basename(theme.filepath))
-                if theme.filepath else "Native Themes",
-        )
-        row.operator("wm.interface_theme_preset_add", text="", icon='ADD')
-        row.operator("wm.interface_theme_preset_remove", text="", icon='REMOVE')
-        row.operator("wm.interface_theme_preset_save", text="", icon='FILE_TICK')
-
-        layout.separator()
+        # Both surfaces expose the same task pages and all native preset actions.
         prefs.draw_sections(layout, addon_prefs, context)
 
 
@@ -892,16 +957,13 @@ classes = (
     PALETTE_STUDIO_ThemeItem,
     PALETTE_STUDIO_PaletteColor,
     PALETTE_STUDIO_OT_refresh_repo,
-    PALETTE_STUDIO_OT_check_updates,
     PALETTE_STUDIO_OT_unload_themes,
-    PALETTE_STUDIO_OT_apply_theme,
     PALETTE_STUDIO_OT_load_palette,
-    PALETTE_STUDIO_OT_apply_custom_palette,
     PALETTE_STUDIO_OT_save_theme,
     PALETTE_STUDIO_OT_reset_palette,
-    PALETTE_STUDIO_OT_swap_colors,
     PALETTE_STUDIO_OT_search_themes,
     PALETTE_STUDIO_OT_preview_swatches,
+    PALETTE_STUDIO_OT_sync_noctalia,
     PALETTE_STUDIO_OT_toggle_favourite,
     PALETTE_STUDIO_UL_theme_list,
     PALETTE_STUDIO_PT_sidebar,
@@ -1006,11 +1068,17 @@ def _unregister_class(cls):
 
 
 def _on_theme_active_update(self, context):
-    """Live-preview callback: apply theme when list selection changes."""
+    """Apply the theme as soon as the list selection changes.
+
+    Selecting a theme in the Palette Browser is the apply action: the browser
+    has no Apply button, only Reset. The Palette Editor is refilled from the
+    same parsed theme so the slots always match what was just applied.
+    Nothing is written to disk here - the live theme
+    (`preferences.themes[0]`) is mutated in memory until the user saves
+    preferences or stores a preset.
+    """
     try:
         addon_prefs = context.preferences.addons[__package__].preferences
-        if not addon_prefs.live_preview:
-            return
     except (KeyError, AttributeError):
         return
 
@@ -1025,11 +1093,20 @@ def _on_theme_active_update(self, context):
     try:
         from . import iterm_parser, blender_theme_map, apply
 
-        palette_theme = iterm_parser.parse_theme_file(theme_item.path)
+        palette_theme = iterm_parser.parse_theme_file(
+            theme_item.path, theme_item.variant)
         _apply_accent_overrides(palette_theme, addon_prefs)
         palette = blender_theme_map.build_palette(palette_theme)
         apply.apply_theme_to_blender(palette)
-        # No XML export, no save — just a visual preview
+        # Keep the Palette Editor in step with what was just applied. Safe to
+        # call from here: the populate clears the loaded flag first, so the
+        # per-slot update callbacks it fires cannot queue another apply.
+        _populate_palette_from_theme(wm, palette_theme)
+        # Persist the stable identity, not the list index: sorting and source
+        # filters can move a palette between sessions.
+        addon_prefs.last_selected_theme_path = theme_item.path
+        addon_prefs.last_selected_theme_variant = theme_item.variant
+        # No XML export, no save - the selection itself is the apply.
     except Exception:
         pass  # Silently skip broken themes during browsing
 
@@ -1152,9 +1229,14 @@ def _populate_theme_list(wm, themes_list, sort_mode=None, filter_mode=None):
     if filter_mode is None:
         filter_mode = _filter_mode_for()
 
+    last_path = ""
+    last_variant = ""
     try:
         from . import prefs as _prefs
         favorite_paths = _prefs.get_favorite_paths()
+        addon_prefs = bpy.context.preferences.addons[__package__].preferences
+        last_path = addon_prefs.last_selected_theme_path
+        last_variant = addon_prefs.last_selected_theme_variant
     except Exception:
         favorite_paths = set()
 
@@ -1170,8 +1252,23 @@ def _populate_theme_list(wm, themes_list, sort_mode=None, filter_mode=None):
         item.source = t.get("source", "")
         item.favorite = t.get("path", "") in favorite_paths
         item.dark = bool(t.get("dark", True))
+        item.variant = t.get("variant", "")
 
     wm.palette_studio_theme_count = len(wm.palette_studio_themes)
+
+    # Restore by path/variant rather than index. Force a -1 -> index transition
+    # so the update callback reapplies the remembered palette after a restart,
+    # even when it happens to sort into position zero.
+    if last_path:
+        restored_index = next(
+            (i for i, item in enumerate(wm.palette_studio_themes)
+             if item.path == last_path and item.variant == last_variant),
+            -1,
+        )
+        if restored_index >= 0:
+            wm.palette_studio_theme_active = -1
+            wm.palette_studio_theme_active = restored_index
+
     return wm.palette_studio_theme_count
 
 
@@ -1310,28 +1407,50 @@ def register():
     bpy.types.WindowManager.palette_studio_palette = CollectionProperty(type=PALETTE_STUDIO_PaletteColor)
     bpy.types.WindowManager.palette_studio_palette_loaded = BoolProperty(default=False)
     bpy.types.WindowManager.palette_studio_palette_theme_name = StringProperty(default="")
-    bpy.types.WindowManager.palette_studio_palette_swap_a = EnumProperty(
-        name="Slot A",
-        description="First color slot to swap",
-        items=_PALETTE_SLOT_ITEMS,
-        default='ansi_0',
+    # Palette Editor > Quick Adjust: relative offsets applied to the checked
+    # ANSI 0-15 slots on top of their (never overwritten) base colours.
+    bpy.types.WindowManager.palette_quick_hue = FloatProperty(
+        name="Hue",
+        description="Hue position for the checked ANSI colours (like Blender's own "
+                    "hue slider: 0.5 leaves them unchanged, 0/1 wrap around)",
+        default=0.5, min=0.0, max=1.0,
+        update=_on_quick_adjust_update,
     )
-    bpy.types.WindowManager.palette_studio_palette_swap_b = EnumProperty(
-        name="Slot B",
-        description="Second color slot to swap",
-        items=_PALETTE_SLOT_ITEMS,
-        default='ansi_1',
+    bpy.types.WindowManager.palette_quick_sat = FloatProperty(
+        name="Saturation",
+        description="Saturation multiplier for the checked ANSI colours "
+                    "(1.0 leaves them unchanged)",
+        default=1.0, min=0.0, max=2.0,
+        update=_on_quick_adjust_update,
+    )
+    bpy.types.WindowManager.palette_quick_val = FloatProperty(
+        name="Value",
+        description="Brightness multiplier for the checked ANSI colours "
+                    "(1.0 leaves them unchanged)",
+        default=1.0, min=0.0, max=2.0,
+        update=_on_quick_adjust_update,
+    )
+    bpy.types.WindowManager.palette_quick_alpha = FloatProperty(
+        name="Alpha",
+        description="Alpha written to every checked ANSI colour",
+        default=1.0, min=0.0, max=1.0,
+        update=_on_quick_adjust_update,
     )
 
 
 def unregister():
     from . import prefs
 
+    # A pending debounced live-apply must not fire into a half-removed add-on.
+    cancel_live_apply()
+
     # Tolerant removal: a previous register() may have stopped partway, so a
     # property can legitimately be missing here.
     for prop_name in (
-        "palette_studio_palette_swap_b",
-        "palette_studio_palette_swap_a",
+        "palette_quick_alpha",
+        "palette_quick_val",
+        "palette_quick_sat",
+        "palette_quick_hue",
         "palette_studio_palette_theme_name",
         "palette_studio_palette_loaded",
         "palette_studio_palette",

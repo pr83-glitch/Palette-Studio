@@ -24,6 +24,7 @@ Supported formats:
   - .conf (kitty config)      — kovidgoyal/kitty-themes
   - .yaml (base24, system: base24) — tinted-theming/schemes
   - .lua (NvChad base46)      — NvChad/base46
+  - .json (Noctalia scheme)   — noctalia-dev/community-palettes
 
 All parsers output the same normalized dict:
     name: str
@@ -40,6 +41,7 @@ All parsers output the same normalized dict:
 """
 
 import plistlib
+import json
 import os
 import re
 from pathlib import Path
@@ -342,6 +344,17 @@ def _prettify_stem(stem, strip_prefixes=()):
     return pretty or str(stem or "")
 
 
+def _spacify_name(name):
+    """Separator normalisation for upstream display names.
+
+    Case is preserved (unlike :func:`_prettify_stem`) so names such as
+    "ANSI 1987" or "GitHub-Dark" survive intact; only hyphens and
+    underscores become spaces, which is what kitty-themes mixes
+    ("Catppuccin-Latte", "Adwaita dark").
+    """
+    return " ".join(str(name or "").replace("_", " ").replace("-", " ").split())
+
+
 def _base16_dict_to_ansi(bases):
     """
     Map a resolved base00..base0F dict to 16 ANSI RGB tuples.
@@ -518,7 +531,11 @@ def parse_kitty_conf(filepath):
         lines = f.readlines()
 
     raw = {}
-    theme_name = filepath.stem
+    # kitty-themes files carry no metadata header (the kovidgoyal set starts
+    # straight at the color keys), so the stem is prettified to match the
+    # naming used by the iTerm2/base24 sources: "Catppuccin-Latte" shows as
+    # "Catppuccin Latte". A "## name:" header still wins when present.
+    theme_name = _prettify_stem(filepath.stem)
 
     for line in lines:
         stripped = line.strip()
@@ -531,7 +548,10 @@ def parse_kitty_conf(filepath):
             if ":" in body:
                 meta_key, _, meta_val = body.partition(":")
                 if meta_key.strip().lower() == "name" and meta_val.strip():
-                    theme_name = meta_val.strip()
+                    # Headers mix "Catppuccin-Latte" with "Adwaita dark";
+                    # normalise the separator so kitty names read like the
+                    # iTerm2/base24 entries for search and comparison.
+                    theme_name = _spacify_name(meta_val.strip())
             continue
         # Full-line comment.
         if stripped.startswith("#"):
@@ -588,18 +608,270 @@ def parse_kitty_conf(filepath):
 
 
 # =========================================================================
+# Alacritty (.toml) parser
+# =========================================================================
+
+#: Alacritty's ANSI order inside [colors.normal] / [colors.bright].
+_ALACRITTY_ANSI_KEYS = (
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+)
+
+#: Alacritty's "use the cell's own colour" keywords.
+_ALACRITTY_KEYWORDS = {
+    "cellforeground": "fg",
+    "cellbackground": "bg",
+}
+
+
+def _load_toml(text):
+    """Parse TOML, preferring the stdlib (Python 3.11+) with a small fallback."""
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None
+    if tomllib is not None:
+        try:
+            return tomllib.loads(text)
+        except Exception:
+            pass
+    return _parse_toml_simple(text)
+
+
+def _parse_toml_simple(text):
+    """Minimal TOML subset: [section] headers and quoted/number key values.
+
+    Only used when ``tomllib`` is unavailable. Handles the Alacritty layout
+    (nested ``[colors.x]`` tables, single- or double-quoted hex strings) and
+    ignores anything it does not need; quoted values keep a '#' intact.
+    """
+    data = {}
+    section = data
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = data
+            for part in line[1:-1].strip().split("."):
+                section = section.setdefault(part.strip(), {})
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            quote = value[0]
+            end = value.find(quote, 1)
+            value = value[1:end] if end != -1 else value[1:]
+        else:
+            value = value.split("#", 1)[0].strip()
+        section[key.strip().strip("'").strip('"')] = value
+    return data
+
+
+def parse_alacritty_toml(filepath):
+    """Parse an Alacritty theme (.toml) from alacritty/alacritty-theme.
+
+    Every theme in that repository (177 files at the pinned revision) uses:
+
+        [colors.primary]     background / foreground
+        [colors.cursor]      cursor / text      (taerminal: background/foreground)
+        [colors.normal]      black .. white  -> ANSI 0-7
+        [colors.bright]      black .. white  -> ANSI 8-15
+        [colors.selection]   background / text (values may be CellForeground /
+                             CellBackground, meaning "the cell's fg/bg")
+
+    Optional sections (dim, hints, search, vi_mode_cursor, indexed_colors,
+    footer_bar, line_indicator) are ignored. Two files at this revision are
+    incomplete - doom_one.toml has no [colors.bright] and citylights.toml has
+    no normal.yellow - so missing slots go through _fill_missing_ansi().
+    """
+    filepath = Path(filepath)
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        data = _load_toml(f.read())
+
+    colors = data.get("colors") if isinstance(data, dict) else None
+    if not isinstance(colors, dict):
+        colors = {}
+    normal = colors.get("normal") if isinstance(colors.get("normal"), dict) else {}
+    bright = colors.get("bright") if isinstance(colors.get("bright"), dict) else {}
+    primary = colors.get("primary") if isinstance(colors.get("primary"), dict) else {}
+    cursor = colors.get("cursor") if isinstance(colors.get("cursor"), dict) else {}
+    selection = colors.get("selection") if isinstance(colors.get("selection"), dict) else {}
+
+    theme = {
+        "name": _prettify_stem(filepath.stem),
+        "path": str(filepath),
+        "source": "alacritty",
+        "ansi": [],
+    }
+
+    def _color(section, key):
+        value = section.get(key)
+        return _hex_to_rgb(value) if isinstance(value, str) else None
+
+    def _keyword(value):
+        """CellForeground / CellBackground -> the theme's own fg / bg."""
+        alias = _ALACRITTY_KEYWORDS.get(str(value or "").strip().lower())
+        return theme.get(alias) if alias else None
+
+    def _value(section, key):
+        """A hex colour, a cell keyword, or None."""
+        value = section.get(key)
+        if not isinstance(value, str):
+            return None
+        return _hex_to_rgb(value) or _keyword(value)
+
+    for key in _ALACRITTY_ANSI_KEYS:
+        theme["ansi"].append(_color(normal, key))
+    for key in _ALACRITTY_ANSI_KEYS:
+        theme["ansi"].append(_color(bright, key))
+    _fill_missing_ansi(theme)
+
+    theme["bg"] = _color(primary, "background") or theme["ansi"][0]
+    theme["fg"] = _color(primary, "foreground") or theme["ansi"][7]
+
+    # Cursor/selection accept both spellings and the cell keywords.
+    theme["cursor"] = (_color(cursor, "cursor")
+                       or _color(cursor, "background")
+                       or _value(cursor, "cursor")
+                       or None)
+    theme["cursor_text"] = _value(cursor, "text") or _value(cursor, "foreground")
+    theme["selection"] = _color(selection, "background") or None
+    theme["selected_text"] = (_value(selection, "text")
+                              or _value(selection, "foreground")
+                              or None)
+    theme["bold"] = None
+
+    return theme
+
+
+# =========================================================================
 # Unified parser — dispatch by file extension
 # =========================================================================
 
-def parse_theme_file(filepath):
-    """Auto-detect format and parse any supported theme file."""
+# =========================================================================
+# Noctalia color schemes (.json)
+# =========================================================================
+# One JSON file per scheme holds BOTH variants:
+#
+#     {"dark": {..., "terminal": {...}}, "light": {..., "terminal": {...}}}
+#
+# The `terminal` block is what a terminal theme needs and maps 1:1 onto ours:
+#
+#     normal.black..white       -> ANSI 0-7
+#     bright.black..white       -> ANSI 8-15
+#     background / foreground   -> bg / fg
+#     cursor / cursorText       -> cursor / cursor_text
+#     selectionBg / selectionFg -> selection / selected_text
+#
+# The 16 `m*` roles next to it (mPrimary, mSurface, ...) describe how Noctalia
+# paints its own shell. They are deliberately not palette keys here: terminal
+# is the palette.
+NOCTALIA_VARIANTS = ("dark", "light")
+_NOCTALIA_ANSI_KEYS = ("black", "red", "green", "yellow", "blue",
+                       "magenta", "cyan", "white")
+
+
+def load_noctalia_scheme(filepath):
+    """Raw Noctalia scheme dict, or {} when the file is not one."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _noctalia_blocks(data):
+    """{variant: block} for every variant the file really carries."""
+    blocks = {}
+    for variant in NOCTALIA_VARIANTS:
+        entry = data.get(variant)
+        if isinstance(entry, dict) and isinstance(entry.get("terminal"), dict):
+            blocks[variant] = entry
+    return blocks
+
+
+def noctalia_variants(filepath):
+    """Variants present in a Noctalia scheme, in dark/light order."""
+    return list(_noctalia_blocks(load_noctalia_scheme(filepath)))
+
+
+def is_noctalia_scheme(filepath):
+    """True when the .json holds at least one Noctalia variant."""
+    return bool(noctalia_variants(filepath))
+
+
+def parse_noctalia_json(filepath, variant="dark"):
+    """Parse one variant of a Noctalia color scheme (mapping above).
+
+    Noctalia names each folder after its scheme and keeps the JSON inside it
+    (``<Name>/<Name>.json``), which is where the display name comes from.
+    """
+    filepath = Path(filepath)
+    blocks = _noctalia_blocks(load_noctalia_scheme(filepath))
+    if not blocks:
+        raise ValueError("Not a Noctalia color scheme: %s" % filepath)
+    if variant not in blocks:
+        variant = next(iter(blocks))
+    term = blocks[variant]["terminal"]
+    normal = term.get("normal") if isinstance(term.get("normal"), dict) else {}
+    bright = term.get("bright") if isinstance(term.get("bright"), dict) else {}
+
+    # Local schemes live in <Name>/<Name>.json and downloaded ones are
+    # flattened to <Name>.json; either way the stem IS the name Noctalia
+    # displays, so it is used verbatim ("ADW" stays "ADW").
+    name = filepath.stem
+
+    theme = {
+        "name": name,
+        "path": str(filepath),
+        "source": "noctalia",
+        "ansi": [],
+    }
+
+    def _color(section, key):
+        value = section.get(key)
+        return _hex_to_rgb(value) if isinstance(value, str) else None
+
+    for key in _NOCTALIA_ANSI_KEYS:
+        theme["ansi"].append(_color(normal, key))
+    for key in _NOCTALIA_ANSI_KEYS:
+        theme["ansi"].append(_color(bright, key))
+    _fill_missing_ansi(theme)
+
+    theme["bg"] = _color(term, "background") or theme["ansi"][0]
+    theme["fg"] = _color(term, "foreground") or theme["ansi"][7]
+    theme["cursor"] = _color(term, "cursor")
+    theme["cursor_text"] = _color(term, "cursorText")
+    theme["selection"] = _color(term, "selectionBg")
+    theme["selected_text"] = _color(term, "selectionFg")
+    theme["bold"] = None
+    theme["variant"] = variant
+
+    return theme
+
+
+def parse_theme_file(filepath, variant=""):
+    """Auto-detect format and parse any supported theme file.
+
+    ``variant`` is only meaningful for Noctalia schemes, which pack a dark and
+    a light palette into one .json ("dark" / "light"); other formats ignore it.
+    """
     filepath = Path(filepath)
     ext = filepath.suffix.lower()
 
+    if ext == ".json":
+        return parse_noctalia_json(filepath, variant or "dark")
     if ext == ".itermcolors":
         return parse_itermcolors(filepath)
     elif ext == ".conf":
         return parse_kitty_conf(filepath)
+    elif ext == ".toml":
+        return parse_alacritty_toml(filepath)
     elif ext == ".lua":
         return parse_base46_lua(filepath)
     elif ext in (".yml", ".yaml"):
@@ -651,7 +923,7 @@ def _fill_missing_ansi(theme):
             theme["ansi"][i] = defaults[i]
 
 
-SUPPORTED_EXTENSIONS = {".itermcolors", ".yml", ".yaml", ".conf", ".lua"}
+SUPPORTED_EXTENSIONS = {".itermcolors", ".yml", ".yaml", ".conf", ".lua", ".toml", ".json"}
 
 
 def is_dark_file(filepath, default=True):
@@ -673,9 +945,11 @@ def scan_folder_detailed(folder_path):
     """
     Scan a folder for supported theme files.
 
-    Returns a list of dicts with name, path, source and dark, using each
-    file parsed display name. Files that do not yield a usable palette
-    are skipped. Deduplicates by lowercase name within the folder.
+    Returns a list of dicts with name, path, source, dark and variant, using
+    each file's parsed display name. Noctalia schemes yield two entries (Dark
+    and Light); a .json that is not a Noctalia scheme yields none. Files that do
+    not yield a usable palette are skipped. Deduplicates by lowercase name
+    within the folder.
     """
     folder = Path(folder_path)
     themes = []
@@ -695,27 +969,34 @@ def scan_folder_detailed(folder_path):
             return
         for f in entries:
             if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
-                try:
-                    parsed = parse_theme_file(str(f))
-                except Exception:
-                    continue
-                if not parsed or not parsed.get("bg"):
-                    continue
-                name = parsed.get("name") or f.stem
-                key = name.lower()
-                if key in seen_names:
-                    continue
-                seen_names.add(key)
-                try:
-                    dark = bool(cm.is_dark(parsed.get("bg")))
-                except Exception:
-                    dark = True
-                themes.append({
-                    "name": name,
-                    "path": str(f),
-                    "source": parsed.get("source", ""),
-                    "dark": dark,
-                })
+                variants = [""]
+                if f.suffix.lower() == ".json":
+                    variants = noctalia_variants(str(f))
+                for variant in variants:
+                    try:
+                        parsed = parse_theme_file(str(f), variant)
+                    except Exception:
+                        continue
+                    if not parsed or not parsed.get("bg"):
+                        continue
+                    name = parsed.get("name") or f.stem
+                    if variant:
+                        name = "%s (%s)" % (name, variant.capitalize())
+                    key = name.lower()
+                    if key in seen_names:
+                        continue
+                    seen_names.add(key)
+                    try:
+                        dark = bool(cm.is_dark(parsed.get("bg")))
+                    except Exception:
+                        dark = True
+                    themes.append({
+                        "name": name,
+                        "path": str(f),
+                        "source": parsed.get("source", ""),
+                        "dark": dark,
+                        "variant": variant,
+                    })
             elif f.is_dir() and depth < 2:
                 _scan_dir(f, depth + 1)
 

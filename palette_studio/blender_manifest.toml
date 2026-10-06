@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "palette_studio"
-version = "1.0.0"
+version = "1.1.0"
 name = "Palette Studio"
-tagline = "Load 900+ terminal and editor palettes as Blender UI themes"
+tagline = "Load 1000+ terminal and editor palettes as Blender UI themes"
 maintainer = "Pr83-Glitch"
 type = "add-on"
 
@@ -21,8 +21,8 @@ copyright = [
 ]
 
 [permissions]
-network = "Downloads color schemes and checks for updates from GitHub repositories"
-files = "Caches themes locally and reads local update ZIP packages"
+network = "Downloads color schemes from GitHub repositories"
+files = "Caches themes locally"
 
 [build]
 paths_exclude_pattern = [
