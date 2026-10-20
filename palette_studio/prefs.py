@@ -1104,14 +1104,14 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         name="NvChad base46",
         description="Show ~105 themes from the NvChad base46 repository "
                     "(downloaded by Load Themes)",
-        default=True,
+        default=False,
         update=_on_source_update,
     )
     source_iterm: BoolProperty(
         name="iTerm2-Color-Schemes",
         description="Show ~250 schemes from the iTerm2-Color-Schemes repository "
                     "(downloaded by Load Themes)",
-        default=False,
+        default=True,
         update=_on_source_update,
     )
     source_base24: BoolProperty(
@@ -1693,7 +1693,6 @@ def _draw_hero(layout, prefs, context):
         badge.alignment = 'RIGHT'
         badge.enabled = False
         badge.label(text="READY", icon='INFO')
-        hero.label(text="1000+ palettes, ready to explore.")
         hero.label(text="Pick one, then make it yours.", icon='COLOR')
 
 
@@ -1964,7 +1963,7 @@ def draw_sections(layout, prefs, context):
     footer.operator("wm.save_userpref", text="Save Preferences", icon='FILE_TICK')
     note = layout.column(align=True)
     note.enabled = False
-    note.label(text="1.2.0")
+    note.label(text="1.2.1")
 
 
 def register():

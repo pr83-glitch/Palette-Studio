@@ -70,7 +70,7 @@ _MAX_ARCHIVE_ENTRIES = 100000
 _MAX_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_THEME_FILE_BYTES = 8 * 1024 * 1024
 _DOWNLOAD_CHUNK = 256 * 1024
-_USER_AGENT = "PaletteStudio/1.2.0 (Blender add-on)"
+_USER_AGENT = "PaletteStudio/1.2.1 (Blender add-on)"
 
 # Local Noctalia schemes and the community-palettes download are ONE source in
 # the UI ("Noctalia"), so both are indexed under this tag and a single Settings

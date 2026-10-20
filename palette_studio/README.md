@@ -1,6 +1,6 @@
 # Palette Studio
 
-**Public release candidate: `1.2.0`.** Not yet published. **Last published public release:** `1.1.0`.
+**Public hotfix: `1.2.1`.** iTerm2 is the default main collection for new preferences; existing saved source choices and the optional Noctalia default are unchanged. The empty header no longer shows the palette-count message.
 
 A full workspace rework with a
 current-palette hero card and a slim, read-only ANSI 0–7 preview, larger icon navigation,
@@ -122,6 +122,11 @@ A couple of deliberate choices: in Edit Mode, unselected edges and vertex dots u
 ### Save Palette Preset
 On the Palette page. Load or edit a palette, click it, give it a name, and Blender saves it as a normal theme preset. If the name already exists, the dialog warns you and asks for overwrite confirmation. The native writer stages a UUID-named XML, validates it, and only then replaces the user preset. Existing presets are backed up under `~/Documents/Backup/Agent Backup/Palette Studio Presets`; a write, validation, backup or replacement failure preserves the original. Built-in and extension presets cannot be overwritten: choose a new name.
 
+### 1.2.1 — default source and header hotfix
+
+- Enables iTerm2 and disables NvChad by default for new preferences, without changing saved source choices or the Noctalia default.
+- Removes the "1000+ palettes, ready to explore." message from the empty header.
+
 ### 1.2.0 — public release candidate
 
 Promotes the tested 1.2.100-beta behavior without changing theme application or saved preferences. Manifest, User-Agent, footer and release ZIP use untagged version 1.2.0. Not yet published.
@@ -238,8 +243,8 @@ Version **1.1.0** maps Common → Animation → Channels to the palette cyan and
 
 Palette Studio downloads from six places:
 
-- [NvChad base46](https://github.com/NvChad/base46) - on by default
-- [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)
+- [NvChad base46](https://github.com/NvChad/base46)
+- [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes) - on by default
 - [tinted-theming base24](https://github.com/tinted-theming/schemes)
 - [kitty-themes](https://github.com/kovidgoyal/kitty-themes)
 - [alacritty-theme](https://github.com/alacritty/alacritty-theme)
