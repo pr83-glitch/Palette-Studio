@@ -20,6 +20,9 @@ Add-on preferences for the Palette.
 
 import bpy
 import json
+import traceback
+from contextlib import contextmanager
+from functools import wraps
 from bpy.props import (
     StringProperty,
     EnumProperty,
@@ -36,6 +39,32 @@ from .palette_slots import ENUM_ITEMS as _ACCENT_ITEMS
 from .palette_slots import FINETUNE_COLOR_ITEMS as _FINETUNE_COLOR_ITEMS
 from .palette_slots import FINETUNE_COLOR_ITEMS_DEFAULTED as _FINETUNE_COLOR_ITEMS_DEFAULTED
 from . import color_math as cm
+
+
+_update_suspensions = 0
+
+
+def updates_suspended():
+    return _update_suspensions > 0
+
+
+@contextmanager
+def suspend_updates():
+    """Suppress live callbacks during registration, migration and restoration."""
+    global _update_suspensions
+    _update_suspensions += 1
+    try:
+        yield
+    finally:
+        _update_suspensions -= 1
+
+
+def _guard_updates(callback):
+    @wraps(callback)
+    def guarded(self, context):
+        if not updates_suspended():
+            return callback(self, context)
+    return guarded
 
 
 # All Finetune colour pickers are `subtype='COLOR'` properties, which Blender
@@ -84,6 +113,8 @@ def _reapply_loaded_palette(context, reset_axes=False):
     that only happens when a *different* palette is applied (see
     reset_axis_colors).
     """
+    if updates_suspended():
+        return False
     try:
         wm = context.window_manager
         if not wm.palette_studio_palette_loaded or not len(wm.palette_studio_palette):
@@ -96,8 +127,11 @@ def _reapply_loaded_palette(context, reset_axes=False):
         prefs = context.preferences.addons[__package__].preferences
         palette_theme = _build_theme_from_palette(wm, prefs, reset_axes)
         palette = blender_theme_map.build_palette(palette_theme)
-        apply.apply_theme_to_blender(palette)
+        result = apply.apply_theme_to_blender(palette)
+        if result is not True:
+            raise RuntimeError(result)
     except Exception:
+        traceback.print_exc()
         return False
 
     _redraw_after_apply()
@@ -127,6 +161,7 @@ def reset_axis_colors(prefs=None):
         _suppress_finetune_color_update = False
 
 
+@_guard_updates
 def _on_accent_update(self, context):
     """Live-apply the accent role choices to the currently loaded palette.
 
@@ -136,6 +171,21 @@ def _on_accent_update(self, context):
     _reapply_loaded_palette(context)
 
 
+@_guard_updates
+def _on_look_style_update(self, context):
+    from .look_styles import ROUNDNESS
+    with suspend_updates():
+        self.finetune_roundness = ROUNDNESS[self.look_style]
+        if self.look_style == 'LAYERED':
+            self.outline_color = self.outline_color_2 = self.outline_color_3 = 'bg'
+        elif self.look_style == 'OUTLINED':
+            self.outline_color_2 = 'fg'
+            self.outline_color_3 = 'fg'
+    # A style selection must not repaint a native preset without a loaded palette.
+    _reapply_loaded_palette(context)
+
+
+@_guard_updates
 def _on_finetune_color_update(self, context):
     """Live-apply the Playhead / Axis colour picks to the loaded palette."""
     if _suppress_finetune_color_update:
@@ -143,6 +193,7 @@ def _on_finetune_color_update(self, context):
     _reapply_loaded_palette(context)
 
 
+@_guard_updates
 def _on_finetune_update(self, context):
     """Live-apply 3D viewport geometry sizes when Finetune values change."""
     try:
@@ -175,6 +226,7 @@ _suppress_bg_primary_update = False
 _suppress_bg_secondary_update = False
 
 
+@_guard_updates
 def _on_roundness_update(self, context):
     """Live-apply the Roundness value to every theme roundness setting."""
     try:
@@ -202,6 +254,7 @@ def _effective_dope_colors(prefs):
     return tuple(text), tuple(sel)
 
 
+@_guard_updates
 def _on_dope_text_update(self, context):
     """Live-apply Dopesheet Channels text colors; keep swatches in sync."""
     global _suppress_dope_update
@@ -212,6 +265,8 @@ def _on_dope_text_update(self, context):
     except Exception:
         return
 
+    # Channel swatches retain their own values; global text overrides win at
+    # application time, just as they do at the end of a full palette apply.
     text, sel = _effective_dope_colors(prefs)
 
     # Show the effective color in the swatch when not overridden.
@@ -226,14 +281,11 @@ def _on_dope_text_update(self, context):
     finally:
         _suppress_dope_update = False
 
-    try:
-        ch = context.preferences.themes[0].regions.channels
-        # Theme colour fields are plain float arrays and expect sRGB; the
-        # swatch properties above hold linear light.
-        ch.text = cm.linear_to_srgb(text)
-        ch.text_selected = cm.linear_to_srgb(sel)
-    except Exception:
-        pass
+    from .apply import apply_channel_text
+    effective_text = prefs.finetune_text if prefs.finetune_text_custom else text
+    effective_sel = prefs.finetune_text_sel if prefs.finetune_text_sel_custom else sel
+    apply_channel_text(context.preferences.themes[0],
+                       cm.linear_to_srgb(effective_text), cm.linear_to_srgb(effective_sel))
 
     try:
         for win in bpy.context.window_manager.windows:
@@ -280,6 +332,7 @@ def _effective_grid_color(prefs):
                  if prefs.finetune_grid_custom else prefs.finetune_grid_def)
 
 
+@_guard_updates
 def _on_grid_color_update(self, context):
     """Live-apply 3D viewport grid color; keep swatch in sync."""
     global _suppress_grid_update
@@ -321,6 +374,29 @@ def _on_grid_color_update(self, context):
         pass
 
 
+@_guard_updates
+def _on_cam_passepartout_update(self, context):
+    """Live-apply the camera passepartout pick.
+
+    Palette-independent by design: the theme's passepartout always follows
+    this persistent pick (default literal #000000), it never follows a
+    palette and has no Custom/default pair. Reload snapshots are covered by
+    suspend_updates, so no separate suppress flag is needed. COLOR property
+    holds linear light; the theme field takes sRGB RGB (3-float RNA, no
+    alpha).
+    """
+    try:
+        prefs = context.preferences.addons[__package__].preferences
+    except Exception:
+        return
+    rgb = cm.linear_to_srgb(tuple(prefs.finetune_cam_passepartout))
+    try:
+        context.preferences.themes[0].view_3d.camera_passepartout = rgb
+    except Exception:
+        pass
+    _redraw_after_apply()
+
+
 def seed_grid_defaults(grid_rgba):
     """Store the current palette's default grid color (sRGB RGBA from apply.py).
 
@@ -344,6 +420,27 @@ def seed_grid_defaults(grid_rgba):
         _suppress_grid_update = False
 
 
+def seed_viewport_background_defaults(background, black):
+    """Refresh palette-derived RGB swatches without overwriting custom picks."""
+    prefs = bpy.context.preferences.addons[__package__].preferences
+    with suspend_updates():
+        for suffix, color in (('a', background), ('b', black)):
+            stored = cm.srgb_to_linear(color[:3])
+            setattr(prefs, 'finetune_gradient_' + suffix + '_def', stored)
+            if not getattr(prefs, 'finetune_gradient_' + suffix + '_custom'):
+                setattr(prefs, 'finetune_gradient_' + suffix, stored)
+
+
+@_guard_updates
+def _on_viewport_background_update(self, context):
+    with suspend_updates():
+        for suffix in ('a', 'b'):
+            if not getattr(self, 'finetune_gradient_' + suffix + '_custom'):
+                setattr(self, 'finetune_gradient_' + suffix,
+                        tuple(getattr(self, 'finetune_gradient_' + suffix + '_def')))
+    _reapply_loaded_palette(context)
+
+
 def _effective_bg_primary(prefs):
     """Return Background 1 in LINEAR light: custom override or palette bg.
 
@@ -365,6 +462,7 @@ def _effective_bg_secondary(prefs):
                  if prefs.finetune_bg_secondary_custom else prefs.finetune_bg_secondary_def)
 
 
+@_guard_updates
 def _on_bg_primary_update(self, context):
     """Live-apply the Background 1 override; keep the swatch in sync."""
     global _suppress_bg_primary_update
@@ -388,6 +486,7 @@ def _on_bg_primary_update(self, context):
     _reapply_loaded_palette(context)
 
 
+@_guard_updates
 def _on_bg_secondary_update(self, context):
     """Live-apply the Background 2 override; keep the swatch in sync."""
     global _suppress_bg_secondary_update
@@ -495,7 +594,7 @@ def seed_ui_scale_defaults():
         return
     _suppress_ui_scale_update = True
     try:
-        prefs.finetune_ui_scale_def = value
+        prefs.finetune_ui_scale_def = current
         prefs.finetune_ui_scale = value
     except Exception:
         pass
@@ -526,6 +625,7 @@ def restore_ui_scale_default():
             pass
 
 
+@_guard_updates
 def _on_ui_scale_update(self, context=None):
     """Live: write the slider straight to Blender's Resolution Scale."""
     global _suppress_ui_scale_update
@@ -572,6 +672,7 @@ def seed_global_text_defaults(text_rgb, selected_rgb):
         _suppress_global_text_update = False
 
 
+@_guard_updates
 def _on_global_text_update(self, context):
     """Live-apply the global Text / Text Selected overrides.
 
@@ -689,6 +790,7 @@ def get_favorite_paths():
         return set()
 
 
+@_guard_updates
 def _on_sort_update(self, context):
     """Re-sort the visible theme list when the persisted sort mode changes."""
     try:
@@ -698,6 +800,7 @@ def _on_sort_update(self, context):
     _on_theme_sort_update(self, context)
 
 
+@_guard_updates
 def _on_filter_update(self, context):
     """Re-filter the visible theme list when the dark/light filter changes."""
     try:
@@ -707,6 +810,7 @@ def _on_filter_update(self, context):
     _on_theme_sort_update(self, context)
 
 
+@_guard_updates
 def _on_source_update(self, context):
     """Re-filter the visible theme list when a theme source is toggled.
 
@@ -714,6 +818,40 @@ def _on_source_update(self, context):
     its already-cached themes. A not-yet-downloaded source stays empty until
     the user runs Load Themes.
     """
+    try:
+        from . import _on_theme_search_update
+    except Exception:
+        return
+    _on_theme_search_update(self, context)
+
+
+@_guard_updates
+def _on_source_mode_update(self, context):
+    """Swap the browser to the index of the newly selected mode.
+
+    LOCAL rebuilds its index by scanning the chosen folder; REMOTE rebuilds
+    its index from the already-cached source directories. Neither path
+    downloads anything, so switching modes is instant and offline-safe, and
+    the two indexes live in separate files so neither overwrites the other.
+    """
+    import os
+
+    from . import repo, download_job
+
+    try:
+        mode = repo.INDEX_LOCAL if self.source_mode == 'LOCAL' else repo.INDEX_REMOTE
+        # Prefer the existing snapshot; never scan a cache mid-publication.
+        if not repo.has_index(mode) and not download_job.is_running():
+            if self.source_mode == 'LOCAL':
+                folder = bpy.path.abspath(self.local_folder)
+                if folder and os.path.isdir(folder):
+                    repo.index_local_folder(folder)
+            else:
+                repo.rebuild_remote_index()
+        self.themes_loaded = repo.has_index(mode)
+    except Exception:
+        traceback.print_exc()
+
     try:
         from . import _on_theme_search_update
     except Exception:
@@ -737,9 +875,9 @@ def _ui_text_styles():
 
 
 def seed_text_style_defaults():
-    """Snapshot Blender's own text-style values while we are not overriding.
+    """Snapshot each native text style independently while not overriding.
 
-    Called by apply.py on every theme apply. A default is only recorded while
+    Called after registration and by apply.py on every theme apply. A default is only recorded while
     the matching Custom toggle is off, so the snapshot stays the user's
     original value and turning Custom off can restore it.
     """
@@ -754,7 +892,22 @@ def seed_text_style_defaults():
     if font_custom and shadow_custom:
         return
 
-    representative = dict(_ui_text_styles()).get("widget")
+    styles = _ui_text_styles()
+    try:
+        snapshots = json.loads(prefs.finetune_text_style_defaults or '{}')
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+    except (TypeError, ValueError):
+        snapshots = {}
+    for index, (key, style) in enumerate(styles):
+        saved = snapshots.setdefault(f'{index}:{key}', {})
+        if not font_custom:
+            saved['points'] = float(style.points)
+        if not shadow_custom and key in _TEXT_SHADOW_KEYS:
+            saved['shadow'] = int(style.shadow)
+    prefs.finetune_text_style_defaults = json.dumps(snapshots)
+
+    representative = dict(styles).get("widget")
     if representative is None:
         return
 
@@ -774,13 +927,14 @@ def seed_text_style_defaults():
         _suppress_text_style_update = False
 
 
-def apply_text_style(prefs=None):
+def apply_text_style(prefs=None, custom_only=False):
     """Write the Finetune text-style values into preferences.ui_styles.
 
     Custom off -> the snapshot value is written back (so switching Custom off
     restores what the user had). Custom on -> the chosen value is enforced.
     Font size covers Panel Title + Widget + Tooltip; shadow only Widget and
-    Tooltip.
+    Tooltip. Palette application uses custom_only=True so disabled groups are
+    untouched; toggle callbacks restore per-style snapshots.
     """
     if prefs is None:
         try:
@@ -804,18 +958,27 @@ def apply_text_style(prefs=None):
     except Exception:
         return
 
-    for key, font_style in styles:
-        try:
-            font_style.points = points
-        except Exception:
-            pass
-        if key in _TEXT_SHADOW_KEYS:
+    try:
+        snapshots = json.loads(prefs.finetune_text_style_defaults or '{}')
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+    except (TypeError, ValueError):
+        snapshots = {}
+    for index, (key, font_style) in enumerate(styles):
+        saved = snapshots.get(f'{index}:{key}', {})
+        if not custom_only or prefs.finetune_font_custom:
             try:
-                font_style.shadow = shadow
+                font_style.points = points if prefs.finetune_font_custom else saved.get('points', points)
+            except Exception:
+                pass
+        if key in _TEXT_SHADOW_KEYS and (not custom_only or prefs.finetune_shadow_custom):
+            try:
+                font_style.shadow = shadow if prefs.finetune_shadow_custom else saved.get('shadow', shadow)
             except Exception:
                 pass
 
 
+@_guard_updates
 def _on_text_style_update(self, context):
     """Live-apply the text-style controls; keep the fields in sync."""
     global _suppress_text_style_update
@@ -851,6 +1014,22 @@ def _on_text_style_update(self, context):
 class PaletteStudioPrefs(bpy.types.AddonPreferences):
     bl_idname = __package__
 
+    look_style: EnumProperty(
+        name="Look Style",
+        description="Surface treatment; preserves palette colors and custom overrides",
+        # Keep Layered=8 and the other surviving IDs stable across upgrades.
+        items=[('LAYERED', "Default", "Layered background, panel and control tones", 8),
+               ('CARD', "Card", "Distinct panel surfaces, soft corners and flat controls", 3),
+               ('OUTLINED', "Outlined", "Flat surfaces and crisp control borders", 5),
+               ('INSET', "Inset", "Recessed panel surfaces with lighter controls", 6),
+               ('ACCENT', "Accent", "Card surfaces with restrained accent-tinted headers", 7)],
+        default='LAYERED', update=_on_look_style_update,
+    )
+    # Legacy restoration fields retained only for saved-preference compatibility.
+    look_style_original_roundness: FloatProperty(
+        default=-1, min=-1, max=1, options={'HIDDEN'})
+    look_style_shading_defaults: StringProperty(default="", options={'HIDDEN'})
+
     # UI-only page selection. Existing section states remain for saved settings.
     ui_page: EnumProperty(
         name="Workspace",
@@ -858,8 +1037,8 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         items=[
             ('BROWSE', "Browse", "Find and apply a palette", 'COLOR', 0),
             ('PALETTE', "Palette", "Edit palette slots and Quick Adjust", 'BRUSHES_ALL', 1),
-            ('APPEARANCE', "Appearance", "Tune interface, viewport and animation", 'PREFERENCES', 2),
-            ('CONFIGURE', "Configure", "Manage sources, cache and native presets", 'TOOL_SETTINGS', 3),
+            ('APPEARANCE', "Finetune", "Tune interface, viewport and animation", 'PREFERENCES', 2),
+            ('CONFIGURE', "Settings", "Manage sources, cache and native presets", 'TOOL_SETTINGS', 3),
         ],
         default='BROWSE',
     )
@@ -882,18 +1061,29 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         default=False,
     )
 
-    # --- Finetune sub-sections (all three open by default) ---
+    show_quick_adjust: BoolProperty(
+        name="Quick Adjust", description="Adjust all checked ANSI colors together", default=True)
+    show_hex: BoolProperty(
+        name="Show Hex", description="Show editable hexadecimal color values beside swatches", default=False)
+    show_cache: BoolProperty(name="Cache", default=False, options={'HIDDEN'})
+    show_presets: BoolProperty(name="Blender Presets", default=False)
+    show_sources: BoolProperty(name="Sources", default=True)
+    show_noctalia: BoolProperty(name="Noctalia Sync", default=False)
+    show_blender_theme: BoolProperty(name="Blender Theme", default=False)
+
+    # Saved fold states are preserved; new profiles start with less detail.
     show_ft_ui: BoolProperty(
         name="User Interface",
-        default=True,
+        default=False,
     )
+    show_ft_fonts: BoolProperty(name="Fonts & Text", default=False)
     show_ft_view3d: BoolProperty(
         name="3D Viewport",
-        default=True,
+        default=False,
     )
     show_ft_extras: BoolProperty(
         name="Extras",
-        default=True,
+        default=False,
     )
 
     # --- Source config ---
@@ -905,6 +1095,8 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
             ('LOCAL', "Local Folder", "Load from a local folder of theme files"),
         ],
         default='REMOTE',
+        update=_on_source_mode_update,
+        options={'HIDDEN'},
     )
 
     # UI / get_enabled_sources() order: NvChad, iTerm2, base24, kitty, alacritty.
@@ -956,6 +1148,7 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         description="Path to a folder containing theme files (.itermcolors, .yml, .yaml, .conf, .toml, .lua)",
         default="",
         subtype='DIR_PATH',
+        options={'HIDDEN'},
     )
 
     # --- Accent roles (which palette slot drives each accent) ---
@@ -984,7 +1177,7 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         name="Outline 1",
         description="Palette slot used for widget outlines, borders and separators",
         items=_ACCENT_ITEMS,
-        default='ansi_8',
+        default='bg',
         update=_on_accent_update,
     )
     outline_color_2: EnumProperty(
@@ -998,7 +1191,7 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         name="Outline 3",
         description="Palette slot used for regular and option widget outlines",
         items=_ACCENT_ITEMS,
-        default='ansi_8',
+        default='bg',
         update=_on_accent_update,
     )
 
@@ -1149,7 +1342,7 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         name="Border Radius",
         description=("Corner roundness for panels and every widget color set "
                      "(Themes > User Interface > Styles / Widgets)"),
-        default=0.4, min=0.0, max=1.0,
+        default=0.5, min=0.0, max=1.0,
         subtype='FACTOR',
         update=_on_roundness_update,
     )
@@ -1188,6 +1381,12 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     finetune_text_shadow_def: IntProperty(
         name="Default Text Shadow",
         default=1, min=0, max=6,
+    )
+
+    finetune_text_style_defaults: StringProperty(
+        name="Original Text Styles",
+        description="Per-style font and shadow snapshots for restoring native settings",
+        default='{}', options={'HIDDEN'},
     )
 
     # --- Finetune: Dopesheet/Timeline Channels text colors ---
@@ -1248,6 +1447,21 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         default=(0.4, 0.4, 0.4, 1.0),
     )
 
+    # --- Finetune: camera passepartout color ---
+    # A single persistent user pick, deliberately WITHOUT a Custom/default
+    # pair: the theme's passepartout always follows this colour, so it never
+    # changes when a palette is applied. Default literal #000000. Not part of
+    # migrate_finetune_colors_to_linear — there are no pre-1.2.2 saved
+    # values for this property, and converting would corrupt future picks.
+    finetune_cam_passepartout: FloatVectorProperty(
+        name="Passepartout",
+        description=("Color outside the camera frame; follows this pick over "
+                     "palette changes (Themes > 3D Viewport > Camera > Passepartout)"),
+        subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0),
+        update=_on_cam_passepartout_update,
+    )
+
     # Set once the Finetune colour properties have been migrated from the old
     # raw-sRGB storage to linear light (see
     # migrate_finetune_colors_to_linear). Not drawn.
@@ -1298,9 +1512,33 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         default=(1.0, 1.0, 1.0),
     )
 
+    finetune_background_type: EnumProperty(
+        name="Background Type",
+        items=[('SINGLE_COLOR', "Static", "Use Gradient A as a solid background"),
+               ('LINEAR', "Gradient", "Blend Gradient A and B vertically"),
+               ('RADIAL', "Vignette", "Blend Gradient A and B radially")],
+        default='SINGLE_COLOR', update=_on_viewport_background_update,
+    )
+    finetune_gradient_a_custom: BoolProperty(
+        name="Custom Gradient A", default=False, update=_on_viewport_background_update)
+    finetune_gradient_a: FloatVectorProperty(
+        name="Gradient A", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0), update=_on_viewport_background_update)
+    finetune_gradient_a_def: FloatVectorProperty(
+        name="Default Gradient A", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0), options={'HIDDEN'})
+    finetune_gradient_b_custom: BoolProperty(
+        name="Custom Gradient B", default=False, update=_on_viewport_background_update)
+    finetune_gradient_b: FloatVectorProperty(
+        name="Gradient B", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0), update=_on_viewport_background_update)
+    finetune_gradient_b_def: FloatVectorProperty(
+        name="Default Gradient B", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0), options={'HIDDEN'})
+
     # --- Finetune: User Interface surface colours --------------------------
     # Background 1 drives every former "background" property (panels, editor
-    # backgrounds, headers, viewport gradient); Background 2 drives the former
+    # backgrounds and headers); Background 2 drives the former
     # bright-black surfaces that are not outlines. Both are direct colour
     # overrides rather than slot picks: while a toggle is off the palette's own
     # background is used, so nothing changes until the user opts in. The
@@ -1309,13 +1547,13 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     # 1.0 and multiplies the design alphas (row_alternate 0.5, frame_node 0.6).
     finetune_bg_primary_custom: BoolProperty(
         name="Custom Background 1",
-        description="Override the colour used by panels, editor backgrounds, headers and the viewport gradient",
+        description="Override the colour used by panels, editor backgrounds and headers",
         default=False,
         update=_on_bg_primary_update,
     )
     finetune_bg_primary: FloatVectorProperty(
         name="Background 1",
-        description="Surface colour for panels, editor backgrounds, headers and the viewport gradient",
+        description="Surface colour for panels, editor backgrounds and headers",
         subtype='COLOR', size=4, min=0.0, max=1.0,
         default=(0.0, 0.0, 0.0, 1.0),
         update=_on_bg_primary_update,
@@ -1357,7 +1595,8 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     )
     finetune_ui_scale_def: FloatProperty(
         name="Default UI Scale",
-        default=1.0, min=1.0, max=2.0, precision=2,
+        default=1.0, min=0.5, max=6.0, precision=2,
+        options={'HIDDEN'},
     )
 
     def get_enabled_sources(self):
@@ -1383,12 +1622,14 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     # Section header helper
     # ------------------------------------------------------------------
     def _draw_section_header(self, layout, prop_name, label, icon):
-        """Draw a foldable section header. Returns the box to draw into,
-        or None if the section is collapsed."""
+        """Draw a foldable card header. Returns the card body when open."""
         is_open = getattr(self, prop_name)
+        layout.separator(factor=0.5)
         box = layout.box()
-        row = box.row()
+        row = box.row(align=True)
         row.alignment = 'LEFT'
+        row.scale_y = 1.15
+        row.label(text="", icon=icon)
         row.prop(
             self, prop_name,
             icon='TRIA_DOWN' if is_open else 'TRIA_RIGHT',
@@ -1396,13 +1637,7 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
             emboss=False,
             icon_only=False,
         )
-        # Put the section icon on the right side of the header
-        sub = row.row()
-        sub.alignment = 'RIGHT'
-        sub.label(icon=icon)
-        if is_open:
-            return box
-        return None
+        return box if is_open else None
 
     # ------------------------------------------------------------------
     # Draw
@@ -1412,8 +1647,8 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
 
 
 def _draw_group(layout, title, icon='NONE'):
-    """Lightweight heading, not another nested box."""
-    layout.separator()
+    """Section heading plus an aligned property column."""
+    layout.separator(factor=0.4)
     layout.label(text=title, icon=icon)
     col = layout.column(align=True)
     col.use_property_split = True
@@ -1435,81 +1670,120 @@ def _selected_theme(wm):
     return wm.palette_studio_themes[index] if 0 <= index < len(wm.palette_studio_themes) else None
 
 
+def _draw_hero(layout, prefs, context):
+    """Current-palette card with a slim, read-only ANSI color ribbon."""
+    wm = context.window_manager
+    hero = layout.box()
+    title = hero.row(align=True)
+    title.scale_y = 1.15
+    if wm.palette_studio_palette_loaded:
+        title.label(text=wm.palette_studio_palette_theme_name or "Untitled Palette", icon='COLOR')
+        badge = title.row()
+        badge.alignment = 'RIGHT'
+        badge.enabled = False
+        badge.label(text="LOADED", icon='CHECKMARK')
+        ribbon = hero.row(align=True)
+        ribbon.scale_y = 0.65
+        for item in wm.palette_studio_palette:
+            if item.slot_id.startswith("ansi_") and int(item.slot_id[5:]) < 8:
+                ribbon.prop(item, "preview_color", text="")
+    else:
+        title.label(text="Palette Studio", icon='COLOR')
+        badge = title.row()
+        badge.alignment = 'RIGHT'
+        badge.enabled = False
+        badge.label(text="READY", icon='INFO')
+        hero.label(text="1000+ palettes, ready to explore.")
+        hero.label(text="Pick one, then make it yours.", icon='COLOR')
+
+
+def _draw_nav(layout, prefs):
+    """Four clear task buttons, two per row for narrow sidebars."""
+    nav = layout.column(align=True)
+    for pages in (('BROWSE', 'PALETTE'), ('APPEARANCE', 'CONFIGURE')):
+        row = nav.row(align=True)
+        row.scale_y = 1.3
+        for page in pages:
+            row.prop_enum(prefs, "ui_page", page)
+
+
 def _draw_browse(layout, prefs, context):
     wm = context.window_manager
-    box = layout.box()
-    row = box.row()
-    row.label(text="Palette Library", icon='COLOR')
-    count = row.row()
+    library = layout.box()
+    header = library.row()
+    header.label(text="Palette Library", icon='COLOR')
+    count = header.row()
     count.alignment = 'RIGHT'
+    count.enabled = False
     count.label(text=str(len(wm.palette_studio_themes)))
+
     loaded = prefs.themes_loaded or bool(wm.palette_studio_themes)
     if not loaded:
-        box.label(text="Start with a palette.", icon='INFO')
-        box.label(text="Choose sources in Configure.")
-        action = box.row()
-        action.scale_y = 1.3
+        library.label(text="Your library is empty.", icon='INFO')
+        library.label(text="Download palettes, then explore.")
+        from . import download_job
+        action = library.row()
+        action.scale_y = 1.5
+        action.enabled = not download_job.is_running()
         action.operator("palette_studio.refresh_repo",
-                        text="Load Local Palettes" if prefs.source_mode == 'LOCAL' else "Download Palettes",
+                        text="Download Palettes",
                         icon='IMPORT')
+        library.prop_enum(prefs, "ui_page", 'CONFIGURE',
+                          text="Choose Sources", icon='TOOL_SETTINGS')
         return
 
-    box.label(text="Select a palette to apply it.")
-    box.prop(wm, "palette_studio_theme_search", text="", icon='VIEWZOOM')
-    box.prop(prefs, "theme_sort", text="Sort")
-    box.prop(prefs, "theme_filter", text="Type")
-    box.template_list("PALETTE_STUDIO_UL_theme_list", "", wm, "palette_studio_themes",
-                      wm, "palette_studio_theme_active", rows=6)
-    selected = _selected_theme(wm)
-    if selected is None:
-        box.label(text="No matching palettes.", icon='INFO')
-        box.label(text="Clear search or change Type.")
-        return
+    search = library.row(align=True)
+    search.scale_y = 1.3
+    search.prop(wm, "palette_studio_theme_search", text="", icon='VIEWZOOM')
+    search.operator("palette_studio.surprise_me", text="", icon='RNDCURVE')
 
-    from . import _SOURCE_LABELS
-    detail = layout.box()
-    detail.label(text=selected.name, icon='COLOR')
-    detail.label(text="%s / %s" % (_SOURCE_LABELS.get(selected.source, selected.source),
-                                 "Dark" if selected.dark else "Light"))
-    row = detail.row(align=True)
-    row.operator("palette_studio.toggle_favourite",
-                 text="Unfavorite" if selected.favorite else "Favorite",
-                 icon='SOLO_ON' if selected.favorite else 'SOLO_OFF')
-    row.prop_enum(prefs, "ui_page", 'PALETTE', text="Edit Palette", icon='BRUSHES_ALL')
+    filter_row = library.row(align=True)
+    filter_row.prop(prefs, "theme_filter", expand=True)
+
+    sort_row = library.row(align=True)
+    sort_row.prop(prefs, "theme_sort", text="Sort")
+
+    library.template_list("PALETTE_STUDIO_UL_theme_list", "", wm, "palette_studio_themes",
+                          wm, "palette_studio_theme_active", rows=8)
+    if not wm.palette_studio_themes:
+        library.label(text="No palettes match.", icon='INFO')
+        library.label(text="Try another search or filter.")
+        return
 
 
 def _draw_palette(layout, prefs, context):
     wm = context.window_manager
     if not wm.palette_studio_palette_loaded:
         box = layout.box()
-        box.label(text="No palette open.", icon='INFO')
-        box.label(text="Select one in Browse first.")
-        box.prop_enum(prefs, "ui_page", 'BROWSE', text="Browse Palettes", icon='COLOR')
+        box.label(text="No palette open.", icon='COLOR')
+        box.label(text="Choose one in Browse to start.")
+        row = box.row()
+        row.scale_y = 1.4
+        row.prop_enum(prefs, "ui_page", 'BROWSE', text="Browse Palettes", icon='COLOR')
         row = box.row()
         row.enabled = _selected_theme(wm) is not None
         row.operator("palette_studio.load_palette", text="Load Selected Palette", icon='IMPORT')
         return
 
-    box = layout.box()
-    box.label(text="Quick Adjust", icon='MODIFIER')
-    box.label(text="Only checked ANSI slots change.")
-    col = box.column(align=True)
-    for prop, label in (("palette_quick_hue", "Hue"), ("palette_quick_sat", "Saturation"),
-                        ("palette_quick_val", "Value"), ("palette_quick_alpha", "Alpha")):
-        col.prop(wm, prop, text=label, slider=True)
-
     groups = (("Base Colors", [item for item in wm.palette_studio_palette
-                               if not item.slot_id.startswith("ansi_")]),
+                               if not item.slot_id.startswith("ansi_")], 'COLOR'),
               ("Standard / ANSI 0-7", [item for item in wm.palette_studio_palette
-                                      if item.slot_id.startswith("ansi_") and int(item.slot_id[5:]) < 8]),
+                                      if item.slot_id.startswith("ansi_") and int(item.slot_id[5:]) < 8],
+               'COLOR'),
               ("Bright / ANSI 8-15", [item for item in wm.palette_studio_palette
-                                      if item.slot_id.startswith("ansi_") and int(item.slot_id[5:]) >= 8]))
-    for title, items in groups:
+                                      if item.slot_id.startswith("ansi_") and int(item.slot_id[5:]) >= 8],
+               'LIGHT'))
+    for title, items, icon in groups:
         box = layout.box()
-        box.label(text=title, icon='COLOR')
+        box.label(text=title, icon=icon)
+        grid = box.grid_flow(row_major=True, columns=2, even_columns=True,
+                             even_rows=True, align=True)
         for item in items:
-            split = box.split(factor=0.45, align=True)
-            name = split.row(align=True)
+            cell = grid.column(align=True)
+            swatch = cell.row()
+            swatch.scale_y = 1.8
+            swatch.prop(item, "color", text="")
+            name = cell.row(align=True)
             if item.slot_id.startswith("ansi_"):
                 name.prop(item, "enabled", text="")
                 # Keep the slot number visible; the group already says Bright.
@@ -1518,20 +1792,46 @@ def _draw_palette(layout, prefs, context):
                 name.label(text=f"{number:02d} {label}")
             else:
                 name.label(text=item.label)
-            values = split.split(factor=0.28, align=True)
-            values.prop(item, "color", text="")
-            values.prop(item, "hex_value", text="")
+            if prefs.show_hex:
+                cell.prop(item, "hex_value", text="")
 
-    box = layout.box()
-    box.label(text="Reset slots, sliders and UI scale.", icon='INFO')
+    layout.prop(prefs, "show_hex")
+    box = prefs._draw_section_header(layout, "show_quick_adjust", "Quick Adjust", 'MODIFIER')
+    if box is not None:
+        box.label(text="Applies to checked ANSI colors.")
+        col = box.column(align=True)
+        for prop, label in (("palette_quick_hue", "Hue"), ("palette_quick_sat", "Saturation"),
+                            ("palette_quick_val", "Value"), ("palette_quick_alpha", "Alpha")):
+            col.prop(wm, prop, text=label, slider=True)
+
+    layout.separator()
+    box = layout.column(align=True)
     box.operator("palette_studio.reset_palette", text="Reset to Original", icon='LOOP_BACK')
     row = box.row()
     row.enabled = _selected_theme(wm) is not None
     row.operator("palette_studio.load_palette", text="Reload Selected Palette", icon='FILE_REFRESH')
+    layout.separator()
+    save = layout.row()
+    save.scale_y = 1.4
+    save.operator("palette_studio.save_theme", text="Save Palette Preset", icon='FILE_TICK')
 
 
 def _draw_appearance(layout, prefs, context):
-    layout.label(text="Changes apply live.", icon='INFO')
+    styles = layout.box()
+    styles.label(text="Choose a Look", icon='SHADING_RENDERED')
+    tiles = (('LAYERED', 'SHADING_SOLID'), ('CARD', 'MOD_BEVEL'),
+             ('OUTLINED', 'MOD_WIREFRAME'), ('INSET', 'MOD_SUBSURF'))
+    grid = styles.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+    for style, icon in tiles:
+        row = grid.row()
+        row.scale_y = 1.25
+        row.prop_enum(prefs, "look_style", style, icon=icon)
+    row = styles.row()
+    row.scale_y = 1.25
+    row.prop_enum(prefs, "look_style", 'ACCENT', icon='COLOR')
+    if not context.window_manager.palette_studio_palette_loaded:
+        styles.label(text="Load a palette to try these looks live.", icon='INFO')
+
     box = prefs._draw_section_header(layout, "show_ft_ui", "Interface", 'USER')
     if box is not None:
         col = _draw_group(box, "Accents & Outlines", 'COLOR')
@@ -1545,17 +1845,29 @@ def _draw_appearance(layout, prefs, context):
         col = _draw_group(box, "Shape & Scale", 'PREFERENCES')
         col.prop(prefs, "finetune_roundness", text="Roundness", slider=True)
         col.prop(prefs, "finetune_ui_scale", text="UI Scale", slider=True)
+
+    box = prefs._draw_section_header(layout, "show_ft_fonts", "Fonts & Text", 'FONT_DATA')
+    if box is not None:
         _draw_group(box, "Typography", 'FONT_DATA')
+        box.label(text="Interface Font")
+        box.prop(context.preferences.view, "font_path_ui", text="")
         for toggle, value, label in (
                 ("finetune_font_custom", "finetune_font_size", "Font Size"),
                 ("finetune_shadow_custom", "finetune_text_shadow", "Shadow"),
                 ("finetune_text_custom", "finetune_text", "Text Color"),
                 ("finetune_text_sel_custom", "finetune_text_sel", "Selected Text")):
             _draw_override(box, prefs, toggle, value, label)
-        box.label(text="Unchecked = follow the theme.")
 
     box = prefs._draw_section_header(layout, "show_ft_view3d", "Viewport", 'VIEW3D')
     if box is not None:
+        col = _draw_group(box, "Background", 'SHADING_RENDERED')
+        col.prop(prefs, "finetune_background_type", text="Type")
+        _draw_override(box, prefs, "finetune_gradient_a_custom", "finetune_gradient_a", "Gradient A")
+        if prefs.finetune_background_type != 'SINGLE_COLOR':
+            _draw_override(box, prefs, "finetune_gradient_b_custom", "finetune_gradient_b", "Gradient B")
+            row = box.row()
+            row.enabled = context.window_manager.palette_studio_palette_loaded
+            row.operator("palette_studio.swap_gradient_colors", text="Swap A / B", icon='ARROW_LEFTRIGHT')
         col = _draw_group(box, "Axes & Selection", 'OBJECT_DATA')
         for prop, label in (("finetune_axis_x", "X Axis"), ("finetune_axis_y", "Y Axis"),
                             ("finetune_axis_z", "Z Axis"), ("finetune_object_selected", "Selected"),
@@ -1567,123 +1879,115 @@ def _draw_appearance(layout, prefs, context):
             col.prop(prefs, prop, text=label)
         box.separator()
         _draw_override(box, prefs, "finetune_grid_custom", "finetune_grid", "Grid Color")
+        col = _draw_group(box, "Camera", 'CAMERA_DATA')
+        col.prop(prefs, "finetune_cam_passepartout", text="Passepartout")
 
     box = prefs._draw_section_header(layout, "show_ft_extras", "Animation", 'ANIM')
     if box is not None:
         col = _draw_group(box, "Timeline Colors", 'TIME')
         col.prop(prefs, "finetune_playhead", text="Playhead")
         col.prop(prefs, "finetune_keyframe_selected", text="Selected Keys")
-        _draw_group(box, "Channel Text", 'FONT_DATA')
-        _draw_override(box, prefs, "finetune_dope_text_custom", "finetune_dope_text", "Normal")
-        _draw_override(box, prefs, "finetune_dope_text_sel_custom", "finetune_dope_text_sel", "Selected")
 
 
 def _draw_configure(layout, prefs, context):
-    from . import repo
-    box = layout.box()
-    box.label(text="Palette Sources", icon='WORLD')
-    box.prop(prefs, "source_mode", text="Location")
-    if prefs.source_mode == 'REMOTE':
-        col = box.column(align=True)
-        for prop, label in (("source_nvchad", "NvChad / base46"), ("source_iterm", "iTerm2"),
+    box = prefs._draw_section_header(layout, "show_sources", "Sources", 'IMPORT')
+    if box is not None:
+        box.use_property_split = False
+        box.label(text="Pick the collections you want to explore.")
+        grid = box.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+        for prop, label in (("source_nvchad", "NvChad"), ("source_iterm", "iTerm2"),
                             ("source_base24", "Base24"), ("source_kitty", "Kitty"),
                             ("source_alacritty", "Alacritty"), ("source_noctalia", "Noctalia")):
-            col.prop(prefs, prop, text=label)
-        box.label(text="Switches filter cached palettes.")
-        box.label(text="Download to add new sources.")
-        if prefs.source_noctalia:
-            box.separator()
-            box.label(text="Noctalia / one-time import", icon='FILE_REFRESH')
-            current = repo.noctalia_sync_source()
-            if current is None:
-                box.label(text="No local theme found.", icon='INFO')
-            elif current[0] == "kitty":
-                box.label(text="Using the live terminal theme.")
-            else:
-                name, variant, _path = current[1]
-                box.label(text=name)
-                box.label(text=f"Variant: {variant.capitalize()}")
-            box.operator("palette_studio.sync_noctalia", text="Sync Current Theme", icon='FILE_REFRESH')
-    else:
-        box.label(text="Folder of supported theme files:")
-        box.prop(prefs, "local_folder", text="")
-        box.label(text="iTerm / YAML / Kitty / Lua")
-        box.label(text="Alacritty TOML / Noctalia JSON")
+            grid.prop(prefs, prop, text=label)
 
-    box.separator()
-    row = box.row()
-    row.scale_y = 1.2
-    row.operator("palette_studio.refresh_repo",
-                 text="Load Local Palettes" if prefs.source_mode == 'LOCAL' else "Download Palettes",
-                 icon='IMPORT')
-    row = box.row()
-    row.enabled = prefs.themes_loaded or bool(context.window_manager.palette_studio_themes)
+    layout.separator()
+    library = layout.column()
+    from . import download_job
+    running = download_job.is_running()
+    row = library.row()
+    row.scale_y = 1.4
+    row.enabled = not running
+    row.operator("palette_studio.refresh_repo", text="Download Palettes", icon='IMPORT')
+    row = library.row()
+    row.enabled = not running and (prefs.themes_loaded
+                                  or bool(context.window_manager.palette_studio_themes))
     row.operator("palette_studio.unload_themes", text="Unload Palettes", icon='TRASH')
-    box.label(text="Unload deletes downloaded files.", icon='INFO')
+    if running:
+        row = library.row()
+        row.scale_y = 1.2
+        row.operator("palette_studio.cancel_download", text="Cancel Download", icon='CANCEL')
+    status = download_job.status_message()
+    if status:
+        library.label(text=status, icon='INFO')
 
-    # Same native preset operators as the original sidebar, now on both surfaces.
+    if prefs.source_noctalia:
+        layout.operator("palette_studio.sync_noctalia", text="noctalia sync (optional)", icon='FILE_REFRESH')
+
+    box = prefs._draw_section_header(layout, "show_blender_theme", "Blender Theme", 'PRESET')
+    if box is not None:
+        box.label(text="Return Blender to its own default colors.")
+        box.operator("palette_studio.restore_theme", text="Restore Blender Theme", icon='LOOP_BACK')
+
+
+def _draw_presets(layout, prefs, context):
+    """Native presets remain available even when the palette library is empty."""
     theme = context.preferences.themes[0]
-    box = layout.box()
-    box.label(text="Blender Theme Presets", icon='PRESET')
-    box.menu("USERPREF_MT_interface_theme_presets",
-             text=bpy.path.display_name(theme.filepath) if theme.filepath else "Choose Preset")
-    row = box.row(align=True)
-    row.operator("wm.interface_theme_preset_add", text="Add", icon='ADD')
-    row.operator("wm.interface_theme_preset_remove", text="Remove", icon='REMOVE')
-    row.operator("wm.interface_theme_preset_save", text="Save", icon='FILE_TICK')
-    box.separator()
-    box.label(text="Colors by source authors.")
+    box = prefs._draw_section_header(layout, "show_presets", "Blender Presets", 'PRESET')
+    if box is not None:
+        box.menu("USERPREF_MT_interface_theme_presets",
+                 text=bpy.path.display_name(theme.filepath) if theme.filepath else "Choose Preset")
+        row = box.row(align=True)
+        row.operator("wm.interface_theme_preset_add", text="Add", icon='ADD')
+        row.operator("wm.interface_theme_preset_remove", text="Remove", icon='REMOVE')
+        row.operator("wm.interface_theme_preset_save", text="Save", icon='FILE_TICK')
 
 
 def draw_sections(layout, prefs, context):
     """Complete task-based workspace shared by Preferences and the N-panel."""
     from . import _ensure_theme_list
     _ensure_theme_list(context)
-    wm = context.window_manager
     layout.use_property_decorate = False
 
-    status = layout.column(align=True)
-    status.label(text="Current Palette", icon='COLOR')
-    status.label(text=wm.palette_studio_palette_theme_name
-                 if wm.palette_studio_palette_loaded else "None selected")
-    nav = layout.column(align=True)
-    for pages in (('BROWSE', 'PALETTE'), ('APPEARANCE', 'CONFIGURE')):
-        row = nav.row(align=True)
-        row.scale_y = 1.15
-        for page in pages:
-            row.prop_enum(prefs, "ui_page", page)
+    _draw_hero(layout, prefs, context)
+    _draw_nav(layout, prefs)
     layout.separator()
 
     drawers = {'BROWSE': _draw_browse, 'PALETTE': _draw_palette,
                'APPEARANCE': _draw_appearance, 'CONFIGURE': _draw_configure}
     drawers[prefs.ui_page](layout, prefs, context)
+    if prefs.ui_page == 'BROWSE':
+        _draw_presets(layout, prefs, context)
 
     layout.separator()
-    footer = layout.column(align=True)
-    row = footer.row()
-    row.scale_y = 1.2
-    row.enabled = wm.palette_studio_palette_loaded
-    row.operator("palette_studio.save_theme", text="Save Palette Preset", icon='FILE_TICK')
-    footer.operator("wm.save_userpref", text="Save Preferences", icon='PREFERENCES')
-    footer.operator("preferences.reset_default_theme", text="Restore Blender Theme", icon='LOOP_BACK')
+    footer = layout.row()
+    footer.scale_y = 1.3
+    footer.operator("wm.save_userpref", text="Save Preferences", icon='FILE_TICK')
     note = layout.column(align=True)
     note.enabled = False
-    note.label(text="Save Preferences to keep this look.")
-    note.label(text="1.1.0")
+    note.label(text="1.2.0")
 
 
 def register():
     from . import _register_class
     _register_class(PaletteStudioPrefs)
-    # Show the Resolution Scale Blender already has (read-only until the user
-    # moves the slider).
-    seed_ui_scale_defaults()
-    try:
+
+
+def initialize_settings():
+    """Initialize only after legacy settings and WindowManager RNA are ready."""
+    with suspend_updates():
+        prefs = bpy.context.preferences.addons[__package__].preferences
+        # Retire the local-folder UI without touching its files or saved theme.
+        prefs.source_mode = 'REMOTE'
+        # Removed styles fall back safely; startup must not repaint the saved theme.
+        if not prefs.look_style:
+            prefs.look_style = 'LAYERED'
+            prefs.finetune_roundness = 0.5
+        prefs.look_style_original_roundness = -1
+        prefs.look_style_shading_defaults = ''
+        seed_ui_scale_defaults()
         migrate_finetune_colors_to_linear(
-            bpy.context.preferences.addons[__package__].preferences
-        )
-    except Exception:
-        pass
+            bpy.context.preferences.addons[__package__].preferences)
+        seed_text_style_defaults()
 
 
 def unregister():

@@ -60,7 +60,7 @@ An entry in ``ROLE_MAP`` is either a slot id (RGB) or a ``(slot, alpha)`` pair
 Adding / changing a role
 ------------------------
 1. Add or edit its line in ``ROLE_MAP`` (or ``COLLECTION_SLOTS`` /
-   ``NODE_SLOTS`` / ``ICON_SLOTS``).
+   ``NODE_SLOTS``; icons live in ``ROLE_MAP``).
 2. Add the key to the dict returned by ``blender_theme_map.build_palette`` only
    if it is a new *top-level* key — it already copies ``ROLE_MAP`` wholesale.
 3. Consume it in ``apply.py`` with ``_set_color`` / ``_try_set``.
@@ -68,7 +68,8 @@ Adding / changing a role
 Known finetune candidates (deliberate consequences of using exact colours):
 text-on-accent roles all resolve to ``fg``, so a theme whose ``fg`` is dim next
 to a mid-tone accent can be hard to read; the dopesheet/timeline current-frame
-ruler keeps ANSI 0 black; ``camera_passepartout`` is the Background 1 colour at a fixed alpha, and
+ruler keeps ANSI 0 black; the camera passepartout is a persistent Finetune
+pick (default #000000) that does not follow the palette, and
 ``grid_line`` / ``wire_color`` stay pinned to ANSI 8 so line work never
 collapses into the surface behind it.
 """
@@ -76,15 +77,6 @@ collapses into the surface behind it.
 # ---------------------------------------------------------------------------
 # Slots
 # ---------------------------------------------------------------------------
-
-#: Named theme colours, resolved directly from the normalized theme dict.
-NAMED_SLOTS = ("bg", "fg", "cursor", "selection")
-
-#: The 16 ANSI colours.
-ANSI_SLOTS = tuple("ansi_%d" % i for i in range(16))
-
-#: Every slot a role may point at directly.
-THEME_SLOTS = NAMED_SLOTS + ANSI_SLOTS
 
 #: Readable aliases -> canonical slot ids (purely cosmetic).
 SLOT_ALIASES = {
@@ -162,8 +154,8 @@ ROLE_MAP = {
     "row_alternate": "bg_primary",     # list stripes follow the main surface
 
     # -- Viewport gradient -------------------------------------------------
-    "viewport_gradient_low": "bg_primary",
-    "viewport_gradient_high": "bg_primary",
+    "viewport_gradient_low": "ansi_0",
+    "viewport_gradient_high": "bg",
 
     # -- Text (the theme's own foreground, no dimmed variants) -------------
     "ui_text": "fg",
@@ -229,7 +221,7 @@ ROLE_MAP = {
 
     # -- Scroll ------------------------------------------------------------
     "scroll_bg": "bg_primary",
-    "scroll_handle": "cursor",
+    "scroll_handle": "accent_tertiary",
     "scroll_handle_hover": "bg_secondary",
 
     # -- Editor header -----------------------------------------------------
@@ -262,7 +254,6 @@ ROLE_MAP = {
     "object_active_color": "object_active_color",
     "outliner_active_obj": "bg_secondary",
     "bone_color": "ansi_7",           # exact ANSI 7 white
-    "camera_passepartout": ("bg_primary", 0.9),
     "before_frame": "ansi_1",
     "after_frame": "accent_tertiary",
     "gizmo_x": "axis_x_color",
@@ -300,13 +291,20 @@ ROLE_MAP = {
 
     # -- Icons -------------------------------------------------------------
     "icon_scene": "ansi_4",
-    "icon_collection": "ansi_6",
-    "icon_object": "accent_tertiary",
+    "icon_collection": "ansi_4",
+    "icon_object": "ansi_3",
     "icon_object_data": "ansi_2",
-    "icon_modifier": "accent_primary",
-    "icon_shading": "accent_secondary",
+    "icon_modifier": "ansi_14",
+    "icon_shading": "ansi_5",
     "icon_folder": "ansi_3",
     "icon_autokey": "ansi_1",
+
+    # -- Animation channels ------------------------------------------------
+    # Blender 5.x Common > Animation, plus the 4.5 per-editor channel groups.
+    "anim_channels": "ansi_12",            # Channels: bright blue
+    "anim_channels_sub": "ansi_4",         # Sub Channels: blue
+    "anim_channel_group": "ansi_2",        # Channel Group: green
+    "anim_channel_group_active": "ansi_10",  # Active Channel Group: bright green
 
     # -- Semantic originals (kept for apply.py compatibility) --------------
     "accent_primary": "accent_primary",
@@ -363,19 +361,6 @@ NODE_SLOTS = {
     "node_layout": "bg_secondary",
 }
 
-#: Blender's collection-color icon overrides, in apply.py order.
-ICON_SLOTS = {
-    "icon_scene": "ansi_4",
-    "icon_collection": "ansi_6",
-    "icon_object": "accent_tertiary",
-    "icon_object_data": "ansi_2",
-    "icon_modifier": "accent_primary",
-    "icon_shading": "accent_secondary",
-    "icon_folder": "ansi_3",
-    "icon_autokey": "ansi_1",
-}
-
-
 # ---------------------------------------------------------------------------
 # Resolution
 # ---------------------------------------------------------------------------
@@ -411,7 +396,7 @@ def _lookup(theme, slot_id):
 
 
 def resolve_slot(theme, slot_id):
-    """Resolve one slot id to an exact RGB tuple.
+    """Resolve one slot id to an exact RGB or RGBA tuple.
 
     Aliases are expanded, then ``SLOT_CHAINS`` is walked until the theme
     supplies a colour. Returns ``LAST_RESORT`` for malformed data.

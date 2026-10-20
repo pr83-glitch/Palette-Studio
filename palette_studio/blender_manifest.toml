@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "palette_studio"
-version = "1.1.0"
+version = "1.2.0"
 name = "Palette Studio"
 tagline = "Load 1000+ terminal and editor palettes as Blender UI themes"
 maintainer = "Pr83-Glitch"

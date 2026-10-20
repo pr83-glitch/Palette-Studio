@@ -126,6 +126,13 @@ def parse_itermcolors(filepath):
         else:
             theme["ansi"].append(None)
 
+    _require_colors(theme, [
+        _extract_rgb(value) for key, value in plist.items()
+        if key in ANSI_KEYS + ["Background Color", "Foreground Color", "Cursor Color",
+                              "Cursor Text Color", "Selection Color", "Selected Text Color", "Bold Color"]
+        and isinstance(value, dict)
+        and any(k in value for k in ("Red Component", "Green Component", "Blue Component"))
+    ], include_ansi=False)
     _fill_missing_ansi(theme)
 
     theme["bg"] = _extract_rgb(plist["Background Color"]) if "Background Color" in plist else theme["ansi"][0]
@@ -182,7 +189,7 @@ def _parse_yaml_simple(text):
                 val = val[:comment_pos].strip()
 
         if indent == 0 or (indent <= 2 and not in_section):
-            if val == '' or val == '':
+            if val == '':
                 # This is a section header like "palette:"
                 in_section = key
             else:
@@ -195,7 +202,7 @@ def _parse_yaml_simple(text):
     return result
 
 
-def parse_gogh_yaml(filepath):
+def parse_gogh_yaml(filepath, _data=None):
     """
     Parse a Gogh YAML theme file.
 
@@ -207,8 +214,10 @@ def parse_gogh_yaml(filepath):
         cursor: cursor hex (optional)
     """
     filepath = Path(filepath)
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        data = _parse_yaml_simple(f.read())
+    if _data is None:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            _data = _parse_yaml_simple(f.read())
+    data = _data
 
     theme_name = data.get("name", filepath.stem)
 
@@ -225,6 +234,8 @@ def parse_gogh_yaml(filepath):
         rgb = _hex_to_rgb(hexval)
         theme["ansi"].append(rgb)
 
+    _require_colors(theme, [_hex_to_rgb(data.get(k)) for k in
+                           ("background", "foreground", "cursor")])
     _fill_missing_ansi(theme)
 
     bg_hex = data.get("background", "")
@@ -246,7 +257,7 @@ def parse_gogh_yaml(filepath):
 # base16 YAML parser
 # =========================================================================
 
-def parse_base16_yaml(filepath):
+def parse_base16_yaml(filepath, _data=None):
     """
     Parse a base16 YAML scheme file.
 
@@ -261,8 +272,10 @@ def parse_base16_yaml(filepath):
         base07 = ANSI 15           base0F = brown
     """
     filepath = Path(filepath)
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        data = _parse_yaml_simple(f.read())
+    if _data is None:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            _data = _parse_yaml_simple(f.read())
+    data = _data
 
     theme_name = data.get("scheme", data.get("name", filepath.stem))
 
@@ -274,24 +287,7 @@ def parse_base16_yaml(filepath):
             hexval = '#' + hexval
         bases[key] = _hex_to_rgb(hexval)
 
-    ansi = [
-        bases.get("base00"),  #  0 Black
-        bases.get("base08"),  #  1 Red
-        bases.get("base0B"),  #  2 Green
-        bases.get("base09"),  #  3 Yellow
-        bases.get("base0D"),  #  4 Blue
-        bases.get("base0E"),  #  5 Magenta
-        bases.get("base0C"),  #  6 Cyan
-        bases.get("base05"),  #  7 White
-        bases.get("base02"),  #  8 Bright Black
-        bases.get("base08"),  #  9 Bright Red
-        bases.get("base0B"),  # 10 Bright Green
-        bases.get("base0A"),  # 11 Bright Yellow
-        bases.get("base0D"),  # 12 Bright Blue
-        bases.get("base0E"),  # 13 Bright Magenta
-        bases.get("base0C"),  # 14 Bright Cyan
-        bases.get("base07"),  # 15 Bright White
-    ]
+    ansi = _base16_dict_to_ansi(bases)
 
     theme = {
         "name": theme_name,
@@ -299,16 +295,10 @@ def parse_base16_yaml(filepath):
         "source": "base16",
         "ansi": ansi,
     }
+    _require_colors(theme, bases.values())
     _fill_missing_ansi(theme)
 
-    theme["bg"] = bases.get("base00") or theme["ansi"][0]
-    theme["fg"] = bases.get("base05") or theme["ansi"][7]
-    theme["cursor"] = bases.get("base06")
-    theme["cursor_text"] = bases.get("base00")
-    theme["selection"] = bases.get("base02")
-    theme["selected_text"] = bases.get("base06")
-    theme["bold"] = None
-
+    _set_base_theme_fields(theme, bases)
     return theme
 
 
@@ -392,7 +382,7 @@ def _set_base_theme_fields(theme, bases):
     theme["bold"] = None
 
 
-def parse_base24_yaml(filepath):
+def parse_base24_yaml(filepath, _data=None):
     """
     Parse a tinted-theming base24 YAML scheme.
 
@@ -400,8 +390,10 @@ def parse_base24_yaml(filepath):
     the darker blacks and the bright variants).
     """
     filepath = Path(filepath)
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        data = _parse_yaml_simple(f.read())
+    if _data is None:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            _data = _parse_yaml_simple(f.read())
+    data = _data
 
     theme_name = data.get("name", data.get("scheme", filepath.stem))
 
@@ -431,10 +423,64 @@ def parse_base24_yaml(filepath):
 # NvChad base46 (.lua) parser
 # =========================================================================
 
+def _lua_strip_comments(text):
+    """
+    Blank out Lua comments, keeping every other character in place.
+
+    Comments must not be able to supply colours or braces: a commented-out
+    ``M.base_16 = { ... }`` would otherwise be picked up as the palette, and a
+    ``{``/``}`` inside a comment would break the table's brace matching. Both
+    ``--`` line comments and ``--[[ ... ]]`` / ``--[==[ ... ]==]`` block
+    comments are blanked; quoted strings are copied verbatim so ``--`` inside
+    one is not treated as a comment.
+    """
+    out = []
+    pos = 0
+    end = len(text)
+    while pos < end:
+        ch = text[pos]
+        if ch in "\x27\x22":
+            # Quoted string: Lua strings do not span lines, so stop at the
+            # closing quote or the newline.
+            stop = pos + 1
+            while stop < end and text[stop] not in (ch, "\n"):
+                stop += 2 if text[stop] == "\\" else 1
+            if stop < end and text[stop] == ch:
+                stop += 1
+            out.append(text[pos:stop])
+            pos = stop
+            continue
+        if ch == "-" and text.startswith("--", pos):
+            after = pos + 2
+            close = None
+            if after < end and text[after] == "[":
+                level = after + 1
+                while level < end and text[level] == "=":
+                    level += 1
+                if level < end and text[level] == "[":
+                    close = "]" + "=" * (level - after - 1) + "]"
+            if close is None:
+                stop = text.find("\n", pos)
+                stop = end if stop == -1 else stop
+            else:
+                stop = text.find(close, level + 1)
+                stop = end if stop == -1 else stop + len(close)
+            out.append(" " * (stop - pos))
+            pos = stop
+            continue
+        out.append(ch)
+        pos += 1
+    return "".join(out)
+
+
 def _lua_table_body(text, name):
     """
     Return the body of a Lua table assignment name = { ... } or None.
+
+    Comments are blanked first, so only real code can supply the assignment
+    and its braces.
     """
+    text = _lua_strip_comments(text)
     idx = text.find(name + " =")
     if idx == -1:
         idx = text.find(name + "=")
@@ -488,7 +534,7 @@ def parse_base46_lua(filepath):
         key = "base" + m.group(1)[4:].upper()
         bases.setdefault(key, _hex_to_rgb(base30.get(m.group(2), "")))
 
-    if not bases.get("base00"):
+    if not any(bases.values()):
         raise ValueError("Not a base46 palette: {}".format(filepath))
 
     theme = {
@@ -582,6 +628,9 @@ def parse_kitty_conf(filepath):
     for i in range(16):
         theme["ansi"].append(_hex_to_rgb(raw.get(f"color{i}", "")))
 
+    _require_colors(theme, [_hex_to_rgb(raw.get(k)) for k in
+        ("background", "foreground", "cursor", "cursor_text_color",
+         "selection_background", "selection_foreground")])
     _fill_missing_ansi(theme)
 
     theme["bg"] = _hex_to_rgb(raw.get("background", "")) or theme["ansi"][0]
@@ -726,18 +775,19 @@ def parse_alacritty_toml(filepath):
         theme["ansi"].append(_color(normal, key))
     for key in _ALACRITTY_ANSI_KEYS:
         theme["ansi"].append(_color(bright, key))
+    _require_colors(theme, [_color(section, key) for section, key in
+        ((primary, "background"), (primary, "foreground"), (cursor, "cursor"),
+         (cursor, "background"), (cursor, "text"), (cursor, "foreground"),
+         (selection, "background"), (selection, "text"), (selection, "foreground"))])
     _fill_missing_ansi(theme)
 
     theme["bg"] = _color(primary, "background") or theme["ansi"][0]
     theme["fg"] = _color(primary, "foreground") or theme["ansi"][7]
 
     # Cursor/selection accept both spellings and the cell keywords.
-    theme["cursor"] = (_color(cursor, "cursor")
-                       or _color(cursor, "background")
-                       or _value(cursor, "cursor")
-                       or None)
+    theme["cursor"] = _value(cursor, "cursor") or _value(cursor, "background")
     theme["cursor_text"] = _value(cursor, "text") or _value(cursor, "foreground")
-    theme["selection"] = _color(selection, "background") or None
+    theme["selection"] = _value(selection, "background")
     theme["selected_text"] = (_value(selection, "text")
                               or _value(selection, "foreground")
                               or None)
@@ -805,14 +855,14 @@ def is_noctalia_scheme(filepath):
     return bool(noctalia_variants(filepath))
 
 
-def parse_noctalia_json(filepath, variant="dark"):
+def parse_noctalia_json(filepath, variant="dark", _data=None):
     """Parse one variant of a Noctalia color scheme (mapping above).
 
     Noctalia names each folder after its scheme and keeps the JSON inside it
     (``<Name>/<Name>.json``), which is where the display name comes from.
     """
     filepath = Path(filepath)
-    blocks = _noctalia_blocks(load_noctalia_scheme(filepath))
+    blocks = _noctalia_blocks(load_noctalia_scheme(filepath) if _data is None else _data)
     if not blocks:
         raise ValueError("Not a Noctalia color scheme: %s" % filepath)
     if variant not in blocks:
@@ -841,6 +891,8 @@ def parse_noctalia_json(filepath, variant="dark"):
         theme["ansi"].append(_color(normal, key))
     for key in _NOCTALIA_ANSI_KEYS:
         theme["ansi"].append(_color(bright, key))
+    _require_colors(theme, [_color(term, k) for k in
+        ("background", "foreground", "cursor", "cursorText", "selectionBg", "selectionFg")])
     _fill_missing_ansi(theme)
 
     theme["bg"] = _color(term, "background") or theme["ansi"][0]
@@ -876,20 +928,13 @@ def parse_theme_file(filepath, variant=""):
         return parse_base46_lua(filepath)
     elif ext in (".yml", ".yaml"):
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(2000)
-        if "color_01:" in content or "color_02:" in content:
-            return parse_gogh_yaml(filepath)
-        elif "base24" in content:
-            return parse_base24_yaml(filepath)
-        elif "base00:" in content or "base00 :" in content:
-            return parse_base16_yaml(filepath)
-        elif "palette:" in content and ("base0" in content or "base1" in content):
-            return parse_base16_yaml(filepath)
-        else:
-            try:
-                return parse_gogh_yaml(filepath)
-            except Exception:
-                return parse_base16_yaml(filepath)
+            data = _parse_yaml_simple(f.read())
+        system = data.get("system", "").lower()
+        if system == "base24" or any("base{:02X}".format(i) in data for i in range(16, 24)):
+            return parse_base24_yaml(filepath, data)
+        if system == "base16" or any("base{:02X}".format(i) in data for i in range(16)):
+            return parse_base16_yaml(filepath, data)
+        return parse_gogh_yaml(filepath, data)
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
@@ -897,6 +942,13 @@ def parse_theme_file(filepath, variant=""):
 # =========================================================================
 # Defaults and scanning
 # =========================================================================
+
+def _require_colors(theme, extra=(), include_ansi=True):
+    """Reject non-palettes before fallback colors make them appear usable."""
+    colors = list(extra) + (theme["ansi"] if include_ansi else [])
+    if not any(c is not None for c in colors):
+        raise ValueError("No recognized colors: {}".format(theme["path"]))
+
 
 def _fill_missing_ansi(theme):
     """Fill missing ANSI colors with reasonable defaults."""
@@ -953,7 +1005,10 @@ def scan_folder_detailed(folder_path):
     """
     folder = Path(folder_path)
     themes = []
-    if not folder.is_dir():
+    try:
+        if not folder.is_dir():
+            return themes
+    except OSError:
         return themes
 
     from . import color_math as cm
@@ -965,16 +1020,22 @@ def scan_folder_detailed(folder_path):
             return
         try:
             entries = sorted(d.iterdir(), key=lambda x: x.name.lower())
-        except PermissionError:
+        except OSError:
             return
         for f in entries:
-            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
+            try:
+                is_file, is_dir = f.is_file(), f.is_dir()
+            except OSError:
+                continue
+            if is_file and f.suffix.lower() in SUPPORTED_EXTENSIONS:
                 variants = [""]
                 if f.suffix.lower() == ".json":
-                    variants = noctalia_variants(str(f))
+                    data = load_noctalia_scheme(f)
+                    variants = list(_noctalia_blocks(data))
                 for variant in variants:
                     try:
-                        parsed = parse_theme_file(str(f), variant)
+                        parsed = (parse_noctalia_json(f, variant, data) if variant
+                                  else parse_theme_file(str(f)))
                     except Exception:
                         continue
                     if not parsed or not parsed.get("bg"):
@@ -997,7 +1058,7 @@ def scan_folder_detailed(folder_path):
                         "dark": dark,
                         "variant": variant,
                     })
-            elif f.is_dir() and depth < 2:
+            elif is_dir and depth < 2:
                 _scan_dir(f, depth + 1)
 
     _scan_dir(folder)

@@ -17,7 +17,7 @@
 """
 Build the flat palette that ``apply.py`` writes into Blender.
 
-Palette Studio uses the source theme's colours **exactly**. There is no
+This mapping uses the source theme's colours **exactly**. There is no
 lightening, darkening, desaturation, contrast fixing or synthetic hue rotation
 here any more: every value is a verbatim copy of one of the theme's own
 colours (the 16 ANSI slots plus ``bg`` / ``fg`` / ``cursor`` / ``selection`` and
@@ -25,14 +25,17 @@ the Finetune picks).
 
 The role -> slot mapping itself lives in :mod:`.color_roles`, so retuning a
 role later is a one-line edit there rather than an edit among dozens of colour
-derivations. This module only adds the three non-colour keys Blender needs
-alongside the table:
+derivations. This module only adds the metadata Blender needs alongside the
+table:
 
 * ``"dark"`` - luminance test on the theme background
 * ``"ansi"`` - the untouched 16 ANSI colours
 * ``"collection_colors"`` - the 8 Collection Color tag colours
+* ``"theme_bg"`` - the raw background used to seed the Background 1 swatch
 
 ``color_math`` is kept here for the luminance test and the debug summary only.
+Look Styles (including the Layered Default) shade UI surface copies in ``apply.py``;
+they never modify this mapping or the source palette.
 """
 
 from . import color_math as cm
