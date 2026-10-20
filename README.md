@@ -49,7 +49,7 @@ By default iTerm2-Color-Schemes is the main source. Enable the others on the **S
 
 Everything lives in **Edit > Preferences > Add-ons > Palette Studio**, and in the 3D Viewport sidebar (<kbd>N</kbd>) under the **Palette Studio** tab, so you can open it while you work.
 
-And the 5 other noctalia users out there like me there an option to sync blender with your noctalia theme with **1 click** in **Palette Studio > Settings > noctalia sync (optional)**
+And for the 5 other noctalia users out there like me there an option to sync blender with your noctalia theme with **1 click** in **Palette Studio > Settings > noctalia sync (optional)**
 
 ## Requirements
 
