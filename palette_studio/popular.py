@@ -94,7 +94,11 @@ POPULAR_THEMES = [
 ]
 
 
-def is_popular(theme_name):
-    """Check if a theme name matches any popular theme."""
+def popular_rank(theme_name):
+    """Position of the first curated entry the name contains (lower = more
+    popular); themes matching none rank after every popular one."""
     name_lower = theme_name.lower()
-    return any(pop in name_lower for pop in POPULAR_THEMES)
+    for rank, pop in enumerate(POPULAR_THEMES):
+        if pop in name_lower:
+            return rank
+    return len(POPULAR_THEMES)

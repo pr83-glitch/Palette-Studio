@@ -93,12 +93,13 @@ _AXIS_SLOT_DEFAULTS = (
 _suppress_finetune_color_update = False
 
 
-def _redraw_after_apply():
-    """Tag every area for redraw so a live Finetune change shows immediately."""
+def _redraw_after_apply(area_type=None):
+    """Tag areas (all, or only ``area_type``) for redraw so a live change shows."""
     try:
         for win in bpy.context.window_manager.windows:
             for area in win.screen.areas:
-                area.tag_redraw()
+                if area_type is None or area.type == area_type:
+                    area.tag_redraw()
     except Exception:
         pass
 
@@ -205,13 +206,7 @@ def _on_finetune_update(self, context):
         v3d.outline_width = prefs.finetune_outline_width
     except Exception:
         return
-    try:
-        for win in bpy.context.window_manager.windows:
-            for area in win.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except Exception:
-        pass
+    _redraw_after_apply('VIEW_3D')
 
 
 # Guards programmatic writes to the Dopesheet text color properties so they
@@ -235,12 +230,7 @@ def _on_roundness_update(self, context):
         apply_roundness(theme, self.finetune_roundness)
     except Exception:
         return
-    try:
-        for win in bpy.context.window_manager.windows:
-            for area in win.screen.areas:
-                area.tag_redraw()
-    except Exception:
-        pass
+    _redraw_after_apply()
 
 
 def _effective_dope_colors(prefs):
@@ -287,12 +277,7 @@ def _on_dope_text_update(self, context):
     apply_channel_text(context.preferences.themes[0],
                        cm.linear_to_srgb(effective_text), cm.linear_to_srgb(effective_sel))
 
-    try:
-        for win in bpy.context.window_manager.windows:
-            for area in win.screen.areas:
-                area.tag_redraw()
-    except Exception:
-        pass
+    _redraw_after_apply()
 
 
 def seed_dope_defaults(text_rgb, selected_rgb):
@@ -365,13 +350,7 @@ def _on_grid_color_update(self, context):
         except Exception:
             pass
 
-    try:
-        for win in bpy.context.window_manager.windows:
-            for area in win.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except Exception:
-        pass
+    _redraw_after_apply('VIEW_3D')
 
 
 @_guard_updates
@@ -580,14 +559,14 @@ def _view_prefs():
 
 
 def seed_ui_scale_defaults():
-    """Show the Resolution Scale Blender already has, clamped to the slider range."""
+    """Show the Resolution Scale Blender already has (its full range fits)."""
     global _suppress_ui_scale_update
     view = _view_prefs()
     try:
         current = float(view.ui_scale) if view is not None else 1.0
     except Exception:
         current = 1.0
-    value = min(2.0, max(1.0, current))
+    value = min(6.0, max(0.5, current))
     try:
         prefs = bpy.context.preferences.addons[__package__].preferences
     except Exception:
@@ -672,6 +651,29 @@ def seed_global_text_defaults(text_rgb, selected_rgb):
         _suppress_global_text_update = False
 
 
+def _sync_native_text_snapshot(context, prefs, text_on, sel_on):
+    """Save the native theme's text colours when an override turns on, and
+    write them back when it turns off (no palette loaded).
+
+    Stored per group ("text" / "sel") in the hidden ``native_text_snapshot``
+    preference, so it survives a restart. A palette apply clears it.
+    """
+    from . import apply
+    theme = context.preferences.themes[0]
+    try:
+        snapshot = json.loads(prefs.native_text_snapshot or "{}")
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+    except ValueError:
+        snapshot = {}
+    for group, on, selected in (("text", text_on, False), ("sel", sel_on, True)):
+        if on and group not in snapshot:
+            snapshot[group] = apply.snapshot_theme_text(theme, selected=selected)
+        elif not on and group in snapshot:
+            apply.restore_theme_text(theme, snapshot.pop(group))
+    prefs.native_text_snapshot = json.dumps(snapshot) if snapshot else ""
+
+
 @_guard_updates
 def _on_global_text_update(self, context):
     """Live-apply the global Text / Text Selected overrides.
@@ -703,12 +705,19 @@ def _on_global_text_update(self, context):
         pass
     finally:
         _suppress_global_text_update = False
+    # Without a loaded palette the theme is a native preset: only the groups
+    # the user switched on are written. A switched-off group keeps the preset's
+    # own colour instead of the last palette's stale default.
+    text_on = prefs.finetune_text_custom
+    sel_on = prefs.finetune_text_sel_custom
     try:
         from .apply import override_theme_text
+        _sync_native_text_snapshot(context, prefs, text_on, sel_on)
         # COLOR properties hold linear light; theme fields expect sRGB.
-        override_theme_text(context.preferences.themes[0],
-                            text=cm.linear_to_srgb(text),
-                            selected=cm.linear_to_srgb(sel))
+        if text_on or sel_on:
+            override_theme_text(context.preferences.themes[0],
+                                text=cm.linear_to_srgb(text) if text_on else None,
+                                selected=cm.linear_to_srgb(sel) if sel_on else None)
     except Exception:
         pass
     _redraw_after_apply()
@@ -780,8 +789,24 @@ _FILTER_ITEMS = [
 ]
 
 
+# Noctalia packs a dark and a light palette into one file, so a favourite of
+# such an entry is stored as "<path>\n<variant>". Plain paths (all other
+# formats, and favourites saved before public 1.2.2, Nov 2026) still match every variant.
+_FAVORITE_VARIANT_SEP = "\n"
+
+
+def favorite_key(path, variant=""):
+    """Stored favourite key for one palette entry."""
+    return path + _FAVORITE_VARIANT_SEP + variant if variant else path
+
+
+def is_favorite(path, variant, favorites):
+    """True when this path/variant entry is marked as a favourite."""
+    return favorite_key(path, variant) in favorites or (bool(variant) and path in favorites)
+
+
 def get_favorite_paths():
-    """Return the persisted set of favourite palette paths."""
+    """Return the persisted set of favourite keys (see ``favorite_key``)."""
     try:
         prefs = bpy.context.preferences.addons[__package__].preferences
         values = json.loads(prefs.favorite_theme_paths or "[]")
@@ -816,42 +841,8 @@ def _on_source_update(self, context):
 
     The index is not rewritten here: toggling a source only hides or shows
     its already-cached themes. A not-yet-downloaded source stays empty until
-    the user runs Load Themes.
+    the user runs Download Palettes.
     """
-    try:
-        from . import _on_theme_search_update
-    except Exception:
-        return
-    _on_theme_search_update(self, context)
-
-
-@_guard_updates
-def _on_source_mode_update(self, context):
-    """Swap the browser to the index of the newly selected mode.
-
-    LOCAL rebuilds its index by scanning the chosen folder; REMOTE rebuilds
-    its index from the already-cached source directories. Neither path
-    downloads anything, so switching modes is instant and offline-safe, and
-    the two indexes live in separate files so neither overwrites the other.
-    """
-    import os
-
-    from . import repo, download_job
-
-    try:
-        mode = repo.INDEX_LOCAL if self.source_mode == 'LOCAL' else repo.INDEX_REMOTE
-        # Prefer the existing snapshot; never scan a cache mid-publication.
-        if not repo.has_index(mode) and not download_job.is_running():
-            if self.source_mode == 'LOCAL':
-                folder = bpy.path.abspath(self.local_folder)
-                if folder and os.path.isdir(folder):
-                    repo.index_local_folder(folder)
-            else:
-                repo.rebuild_remote_index()
-        self.themes_loaded = repo.has_index(mode)
-    except Exception:
-        traceback.print_exc()
-
     try:
         from . import _on_theme_search_update
     except Exception:
@@ -1003,12 +994,7 @@ def _on_text_style_update(self, context):
 
     apply_text_style(prefs)
 
-    try:
-        for win in bpy.context.window_manager.windows:
-            for area in win.screen.areas:
-                area.tag_redraw()
-    except Exception:
-        pass
+    _redraw_after_apply()
 
 
 class PaletteStudioPrefs(bpy.types.AddonPreferences):
@@ -1044,31 +1030,12 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     )
 
     # --- Foldable section states ---
-    show_browser: BoolProperty(
-        name="Theme Browser",
-        default=True,
-    )
-    show_palette_editor: BoolProperty(
-        name="Palette Editor",
-        default=False,
-    )
-    show_finetune: BoolProperty(
-        name="Finetune",
-        default=False,
-    )
-    show_settings: BoolProperty(
-        name="Settings",
-        default=False,
-    )
-
     show_quick_adjust: BoolProperty(
         name="Quick Adjust", description="Adjust all checked ANSI colors together", default=True)
     show_hex: BoolProperty(
         name="Show Hex", description="Show editable hexadecimal color values beside swatches", default=False)
-    show_cache: BoolProperty(name="Cache", default=False, options={'HIDDEN'})
     show_presets: BoolProperty(name="Blender Presets", default=False)
     show_sources: BoolProperty(name="Sources", default=True)
-    show_noctalia: BoolProperty(name="Noctalia Sync", default=False)
     show_blender_theme: BoolProperty(name="Blender Theme", default=False)
 
     # Saved fold states are preserved; new profiles start with less detail.
@@ -1087,68 +1054,48 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     )
 
     # --- Source config ---
-    source_mode: EnumProperty(
-        name="Source Mode",
-        description="Where to load themes from",
-        items=[
-            ('REMOTE', "Remote Repositories", "Download from public Git repositories"),
-            ('LOCAL', "Local Folder", "Load from a local folder of theme files"),
-        ],
-        default='REMOTE',
-        update=_on_source_mode_update,
-        options={'HIDDEN'},
-    )
-
     # UI / get_enabled_sources() order: NvChad, iTerm2, base24, kitty, alacritty.
     source_nvchad: BoolProperty(
         name="NvChad base46",
         description="Show ~105 themes from the NvChad base46 repository "
-                    "(downloaded by Load Themes)",
+                    "(fetched by Download Palettes)",
         default=False,
         update=_on_source_update,
     )
     source_iterm: BoolProperty(
         name="iTerm2-Color-Schemes",
         description="Show ~250 schemes from the iTerm2-Color-Schemes repository "
-                    "(downloaded by Load Themes)",
+                    "(fetched by Download Palettes)",
         default=True,
         update=_on_source_update,
     )
     source_base24: BoolProperty(
         name="base24",
         description="Show ~230 schemes from the tinted-theming base24 repository "
-                    "(downloaded by Load Themes)",
+                    "(fetched by Download Palettes)",
         default=False,
         update=_on_source_update,
     )
     source_kitty: BoolProperty(
         name="kitty-themes",
         description="Show ~412 themes from the kovidgoyal/kitty-themes repository "
-                    "(downloaded by Load Themes)",
+                    "(fetched by Download Palettes)",
         default=False,
         update=_on_source_update,
     )
     source_alacritty: BoolProperty(
         name="alacritty-theme",
         description="Show ~177 themes from the alacritty/alacritty-theme repository "
-                    "(downloaded by Load Themes)",
+                    "(fetched by Download Palettes)",
         default=False,
         update=_on_source_update,
     )
     source_noctalia: BoolProperty(
         name="Noctalia",
         description="Show the Noctalia color schemes found on this machine plus the "
-                    "community palettes (downloaded by Load Themes)",
+                    "community palettes (fetched by Download Palettes)",
         default=True,
         update=_on_source_update,
-    )
-
-    local_folder: StringProperty(
-        name="Local Folder",
-        description="Path to a folder containing theme files (.itermcolors, .yml, .yaml, .conf, .toml, .lua)",
-        default="",
-        subtype='DIR_PATH',
-        options={'HIDDEN'},
     )
 
     # --- Accent roles (which palette slot drives each accent) ---
@@ -1258,7 +1205,7 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         update=_on_finetune_color_update,
     )
 
-    # Internal marker: set by Load Themes, cleared by Unload. Lets the theme
+    # Internal marker: set by Download Palettes, cleared by Unload. Lets the theme
     # list be restored after a restart without re-downloading. Not drawn.
     themes_loaded: BoolProperty(
         name="Themes Loaded",
@@ -1269,6 +1216,13 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
         name="Favourite Palettes",
         description="JSON-encoded paths of palettes marked as favourites",
         default="[]",
+        options={'HIDDEN'},
+    )
+    native_text_snapshot: StringProperty(
+        name="Native Text Snapshot",
+        description="Native theme text colours saved while a Text override is on "
+                    "(no palette loaded), restored when it is turned off",
+        default="",
         options={'HIDDEN'},
     )
     last_selected_theme_path: StringProperty(
@@ -1588,9 +1542,9 @@ class PaletteStudioPrefs(bpy.types.AddonPreferences):
     finetune_ui_scale: FloatProperty(
         name="UI Scale",
         description=("Blender's interface Resolution Scale (Preferences > Interface > "
-                     "Display). Seeded from the value Blender already has; this "
-                     "slider covers 1.00-2.00"),
-        default=1.0, min=1.0, max=2.0, precision=2,
+                     "Display). Seeded from the value Blender already has; drag "
+                     "covers 0.75-2.00, type any value Blender accepts (0.50-6.00)"),
+        default=1.0, min=0.5, max=6.0, soft_min=0.75, soft_max=2.0, precision=2,
         update=_on_ui_scale_update,
     )
     finetune_ui_scale_def: FloatProperty(
@@ -1674,6 +1628,11 @@ def _draw_hero(layout, prefs, context):
     """Current-palette card with a slim, read-only ANSI color ribbon."""
     wm = context.window_manager
     hero = layout.box()
+    error = getattr(wm, "palette_studio_last_error", "")
+    if error:
+        alert = hero.row()
+        alert.alert = True
+        alert.label(text=error, icon='ERROR')
     title = hero.row(align=True)
     title.scale_y = 1.15
     if wm.palette_studio_palette_loaded:
@@ -1706,6 +1665,22 @@ def _draw_nav(layout, prefs):
             row.prop_enum(prefs, "ui_page", page)
 
 
+def _draw_download_status(layout):
+    """Progress, Cancel and the last result of a palette download."""
+    from . import download_job
+    running = download_job.is_running()
+    status = download_job.status_message()
+    if running:
+        row = layout.row()
+        row.scale_y = 1.2
+        row.operator("palette_studio.cancel_download", text="Cancel Download", icon='CANCEL')
+    if status:
+        result = download_job.result() or {}
+        failed = not running and result.get("status") in ("error", "partial")
+        layout.label(text=status, icon='ERROR' if failed else 'INFO')
+    return running
+
+
 def _draw_browse(layout, prefs, context):
     wm = context.window_manager
     library = layout.box()
@@ -1727,9 +1702,14 @@ def _draw_browse(layout, prefs, context):
         action.operator("palette_studio.refresh_repo",
                         text="Download Palettes",
                         icon='IMPORT')
+        _draw_download_status(library)
         library.prop_enum(prefs, "ui_page", 'CONFIGURE',
                           text="Choose Sources", icon='TOOL_SETTINGS')
         return
+
+    from . import download_job
+    if download_job.is_running():
+        _draw_download_status(library)
 
     search = library.row(align=True)
     search.scale_y = 1.3
@@ -1911,20 +1891,17 @@ def _draw_configure(layout, prefs, context):
     row.enabled = not running and (prefs.themes_loaded
                                   or bool(context.window_manager.palette_studio_themes))
     row.operator("palette_studio.unload_themes", text="Unload Palettes", icon='TRASH')
-    if running:
-        row = library.row()
-        row.scale_y = 1.2
-        row.operator("palette_studio.cancel_download", text="Cancel Download", icon='CANCEL')
-    status = download_job.status_message()
-    if status:
-        library.label(text=status, icon='INFO')
+    _draw_download_status(library)
 
     if prefs.source_noctalia:
         layout.operator("palette_studio.sync_noctalia", text="noctalia sync (optional)", icon='FILE_REFRESH')
 
     box = prefs._draw_section_header(layout, "show_blender_theme", "Blender Theme", 'PRESET')
     if box is not None:
-        box.label(text="Return Blender to its own default colors.")
+        box.label(text="Go back to the theme you had before a palette.")
+        box.operator("palette_studio.restore_previous_theme",
+                     text="Restore Previous Theme", icon='RECOVER_LAST')
+        box.label(text="Or return Blender to its own default colors.")
         box.operator("palette_studio.restore_theme", text="Restore Blender Theme", icon='LOOP_BACK')
 
 
@@ -1963,7 +1940,8 @@ def draw_sections(layout, prefs, context):
     footer.operator("wm.save_userpref", text="Save Preferences", icon='FILE_TICK')
     note = layout.column(align=True)
     note.enabled = False
-    note.label(text="1.2.1")
+    from . import repo
+    note.label(text=repo.VERSION)
 
 
 def register():
@@ -1975,12 +1953,15 @@ def initialize_settings():
     """Initialize only after legacy settings and WindowManager RNA are ready."""
     with suspend_updates():
         prefs = bpy.context.preferences.addons[__package__].preferences
-        # Retire the local-folder UI without touching its files or saved theme.
-        prefs.source_mode = 'REMOTE'
         # Removed styles fall back safely; startup must not repaint the saved theme.
         if not prefs.look_style:
             prefs.look_style = 'LAYERED'
             prefs.finetune_roundness = 0.5
+        # Channel Text controls were removed from the UI; an override saved
+        # by an older version would otherwise stay active with no way to turn
+        # it off. Channels follow the palette's own text colours again.
+        prefs.finetune_dope_text_custom = False
+        prefs.finetune_dope_text_sel_custom = False
         prefs.look_style_original_roundness = -1
         prefs.look_style_shading_defaults = ''
         seed_ui_scale_defaults()

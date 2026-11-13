@@ -2,7 +2,7 @@
 
 # Palette Studio
 
-**Public hotfix: `1.2.1`.** Makes iTerm2 the default main source for new preferences and removes the empty-header palette-count message. Existing saved source choices and the optional Noctalia default are preserved. Includes the validated v1.2.0 workspace and theme improvements.
+**Version `1.2.2`.** Adds Blender 5.3 support, Restore Previous Theme and several fixes (see the 1.2.2 notes below). Builds on 1.2.1, which made iTerm2 the default main source for new preferences. Existing saved source choices and the optional Noctalia default are preserved.
 
 1000+ easy to customize themes in 1 click!
 
@@ -49,11 +49,20 @@ By default iTerm2-Color-Schemes is the main source. Enable the others on the **S
 
 Everything lives in **Edit > Preferences > Add-ons > Palette Studio**, and in the 3D Viewport sidebar (<kbd>N</kbd>) under the **Palette Studio** tab, so you can open it while you work.
 
-And for the 5 other noctalia users out there like me there an option to sync blender with your noctalia theme with **1 click** in **Palette Studio > Settings > noctalia sync (optional)**
+### The workspace — v1.2.2
+
+The complete UI is available in both Preferences and the sidebar. A current-palette hero card with a slim, single-row ANSI 0–7 preview sits above four icon task pages. The preview is read-only; use Palette to edit colors.
+
+- **Browse** — a large always-visible search, All / Dark / Light filter pills, sort, a clickable favorite star on every palette row and the collapsible **Blender Presets** section at the bottom. The shuffle button picks a **Surprise Me** random palette. Use the **Palette** page to edit.
+- **Palette** — a two-column color workbench: every one of the 20 live-editable slots is a large swatch tile with its label, grouped into Base Colors, Standard ANSI and Bright ANSI. **Show Hex** adds a hex field under each tile; **Quick Adjust** sits below the colors, starts expanded in new profiles and keeps saved fold choices. Reset, reload and Save Palette Preset remain available.
+- **Finetune** (formerly Appearance) — five clickable **Look Style** tiles: Default (formerly Layered), Card, Outlined, Inset and Accent. Default is selected for new profiles. **Interface**, **Fonts & Text**, **Viewport** and **Animation** are boxed disclosures that start collapsed in new profiles. Fonts & Text contains Blender's native Interface Font picker and all text/font overrides. Viewport adds Static/Gradient/Vignette backgrounds, custom Gradient A/B picks and Swap A/B.
+- **Settings** — boxed **Sources** and **Blender Theme** cards. Six remote sources sit in a two-column grid. **Download Palettes** and **Unload Palettes** stay together without a section heading; progress and Cancel appear during downloads. **noctalia sync (optional)** imports the current local Noctalia theme when that source is enabled. Restore Blender Theme is inside its card; native presets stay in Browse.
+
+The current build maps Common > Animation > Channels to bright blue, Sub-channels to blue, Active Channel Group to bright green and Channel Group to green. Selected Dope Sheet/Timeline keyframe borders use the palette foreground at full opacity. The header preview shows exact palette colors and stays read-only.
 
 ## Requirements
 
-- Blender 4.5 or newer (4.5 LTS and 5.x both work)
+- Blender 4.5 or newer (tested on 4.5 LTS, 5.2 LTS and 5.3)
 - An internet connection for the first download
 
 ## Documentation

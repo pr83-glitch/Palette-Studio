@@ -29,7 +29,39 @@ Comprehensive mapping covering:
 - All editor spaces
 """
 
+import os
+
 from . import color_math as cm
+
+# Set PALETTE_STUDIO_DEBUG=1 before starting Blender to print, after each
+# apply, the theme fields this Blender version does not have. Fields are
+# skipped silently otherwise, so a renamed property in a new Blender release
+# (e.g. the header/title colours removed in 5.3) can be found in one run.
+_DEBUG = bool(os.environ.get("PALETTE_STUDIO_DEBUG"))
+_skipped = set()
+
+
+def _note_skipped(obj, attr):
+    if _DEBUG:
+        try:
+            owner = obj.bl_rna.identifier
+        except Exception:
+            owner = type(obj).__name__
+        _skipped.add(owner + "." + attr)
+
+
+def _struct(root, path):
+    """Nested theme struct by dotted path, or None when this Blender lacks it.
+
+    Used for the 5.x unified sections so one reorganized struct only skips its
+    own colours instead of aborting the whole apply half-way.
+    """
+    for name in path.split("."):
+        root = getattr(root, name, None)
+        if root is None:
+            _note_skipped(object(), path)
+            return None
+    return root
 
 
 def _srgb_from_linear_rgba(rgba):
@@ -43,6 +75,7 @@ def _set_color(obj, attr, color):
     Handles RGB(3) vs RGBA(4) mismatches via try/except cascade.
     """
     if not hasattr(obj, attr):
+        _note_skipped(obj, attr)
         return
 
     color = tuple(float(c) for c in color)
@@ -89,7 +122,7 @@ def _try_set(obj, attr, value):
     try:
         setattr(obj, attr, value)
     except (AttributeError, TypeError, ValueError):
-        pass
+        _note_skipped(obj, attr)
 
 
 def _rgba(color, alpha=None):
@@ -137,6 +170,72 @@ def _iter_theme_structs(struct, depth=0):
             continue
         for item in _iter_theme_structs(child, depth + 1):
             yield item
+
+
+_TEXT_FIELDS = ('text',)
+_SELECTED_FIELDS = ('text_sel', 'text_selected')
+
+
+def _iter_theme_paths(struct, path="", depth=0):
+    """Like ``_iter_theme_structs`` but also yields each struct's dotted path.
+
+    Theme structs do not support ``path_from_id()``, so the path is built
+    during the walk; ``_resolve_theme_path`` reverses it.
+    """
+    if depth > 3:
+        return
+    yield path, struct
+    try:
+        props = struct.bl_rna.properties
+    except Exception:
+        return
+    for prop in props:
+        if prop.type != 'POINTER' or prop.identifier == 'rna_type':
+            continue
+        try:
+            child = getattr(struct, prop.identifier)
+            child.bl_rna
+        except Exception:
+            continue
+        child_path = prop.identifier if not path else path + "." + prop.identifier
+        for item in _iter_theme_paths(child, child_path, depth + 1):
+            yield item
+
+
+def _resolve_theme_path(theme, path):
+    struct = theme
+    for name in path.split(".") if path else ():
+        struct = getattr(struct, name, None)
+        if struct is None:
+            return None
+    return struct
+
+
+def snapshot_theme_text(theme, selected=False):
+    """Current plain text (or text-selected) colours, keyed "path|field".
+
+    Taken before a native-theme text override so turning the override off can
+    put the theme's own colours back (see ``restore_theme_text``).
+    """
+    fields = _SELECTED_FIELDS if selected else _TEXT_FIELDS
+    snapshot = {}
+    for path, struct in _iter_theme_paths(theme):
+        for field in fields:
+            try:
+                value = getattr(struct, field)
+                snapshot[path + "|" + field] = [float(c) for c in value]
+            except Exception:
+                continue
+    return snapshot
+
+
+def restore_theme_text(theme, snapshot):
+    """Write a ``snapshot_theme_text`` result back (missing fields skipped)."""
+    for key, value in (snapshot or {}).items():
+        path, _sep, field = key.rpartition("|")
+        struct = _resolve_theme_path(theme, path)
+        if struct is not None and field:
+            _set_color(struct, field, value)
 
 
 def override_theme_text(theme, text=None, selected=None):
@@ -232,6 +331,7 @@ def apply_theme_to_blender(palette):
         return "bpy not available - not running inside Blender"
 
     _is_5 = bpy.app.version >= (5, 0, 0)
+    _skipped.clear()
 
     theme = bpy.context.preferences.themes[0]
     p = palette
@@ -248,6 +348,10 @@ def apply_theme_to_blender(palette):
         }
     except Exception:
         _sizes = {"edge_width": 1, "vertex_size": 3, "facedot_size": 3, "outline_width": 1}
+    if _prefs is not None:
+        # A palette replaces the native theme, so a saved native text snapshot
+        # (see prefs._on_global_text_update) no longer describes it.
+        _try_set(_prefs, 'native_text_snapshot', '')
 
     from .look_styles import surface_palette
     style = getattr(_prefs, 'look_style', 'LAYERED') or 'LAYERED'
@@ -650,7 +754,6 @@ def apply_theme_to_blender(palette):
         _set_color(v3d, 'camera_passepartout', cam_passepartout)
     except Exception:
         pass
-    _set_color(v3d, 'lamp', p["warning"])
     _set_color(v3d, 'light', p["warning"])
     _set_color(v3d, 'speaker', p["ui_text_muted"])
     _set_color(v3d, 'text_grease_pencil', p["success"])
@@ -665,7 +768,6 @@ def apply_theme_to_blender(palette):
     _set_color(v3d, 'lastsel_point', p["ui_text_highlight"])
     _set_color(v3d, 'normal', p["accent_tertiary"])
     _set_color(v3d, 'vertex_normal', p["ui_accent"])
-    _set_color(v3d, 'loop_normal', p["magenta"])
     _set_color(v3d, 'split_normal', p["danger"])
     _set_color(v3d, 'face_back', _rgba(p["ui_accent"], 0.1))
     _set_color(v3d, 'face_front', _rgba(p["ui_accent"], 0.2))
@@ -720,7 +822,6 @@ def apply_theme_to_blender(palette):
     _set_color(o, 'active', p["list_highlight"])  # Themes > Outliner > Active Highlight
     _set_color(o, 'selected_object', p["ui_text"] if style == 'LAYERED' else _rgba(p["obj_selected"], 0.3))
     _set_color(o, 'active_object', source_bg if style == 'LAYERED' else _rgba(p["black"], 0.5))
-    _set_color(o.space, 'text_highlight', _rgba(p["black"], 0.5))
     _set_color(o, 'edited_object', _rgba(p["success"], 0.3))
     _set_color(o, 'row_alternate', _rgba(p["row_alternate"], 0.5))
 
@@ -779,7 +880,9 @@ def apply_theme_to_blender(palette):
     # =====================================================================
     set_space_generic(theme.dopesheet_editor.space)
     de = theme.dopesheet_editor
-    # Current-frame ruler text in the header uses the palette background.
+    # Current-frame number on the playhead box uses the palette background.
+    # Blender 5.3 removed header_text_hi; the number then follows the
+    # editor's Text Highlight colour (time_scrub_ui.cc uses TH_TEXT_HI).
     _set_color(de.space, 'header_text_hi', p["theme_bg"])
     _set_color(de, 'grid', p["grid_line"])
     # Summary row/track uses the palette accent (all Blender versions)
@@ -813,8 +916,6 @@ def apply_theme_to_blender(palette):
         _set_color(de, 'keyframe_jitter_selected', p["success"])
         _set_color(de, 'keyframe_movehold', p["magenta"])
         _set_color(de, 'keyframe_movehold_selected', p["bright_magenta"])
-        _set_color(de, 'channels_region', p["ui_panel"])
-        _set_color(de, 'window_sliders', p["ui_accent"])
         _set_color(de, 'time_scrub_background', _rgba(p["ui_panel"], 0.75))
         _set_color(de, 'time_marker_line', _rgba(p["warning"], 0.5))
         _set_color(de, 'time_marker_line_selected', _rgba(p["ui_accent"], 0.8))
@@ -838,7 +939,6 @@ def apply_theme_to_blender(palette):
     _set_color(ne, 'converter_node', p["node_converter"])
     _set_color(ne, 'color_node', p["node_color"])
     _set_color(ne, 'group_node', p["node_group"])
-    _set_color(ne, 'interface_node', p["node_interface"])
     _set_color(ne, 'input_node', p["node_input"])
     _set_color(ne, 'output_node', p["node_output"])
     _set_color(ne, 'matte_node', p["node_matte"])
@@ -883,25 +983,6 @@ def apply_theme_to_blender(palette):
         _set_color(nla, 'time_marker_line_selected', _rgba(p["ui_accent"], 0.8))
 
     # =====================================================================
-    # TIMELINE
-    # =====================================================================
-    try:
-        set_space_generic(theme.timeline.space)
-        tl = theme.timeline
-        # Current-frame ruler text in the header uses the palette background.
-        _set_color(theme.timeline.space, 'header_text_hi', p["theme_bg"])
-        _set_color(tl, 'grid', p["grid_line"])
-        # Summary row uses the palette accent
-        _set_color(tl, 'summary', _rgba(p["ui_accent"], chan_a))
-        if not _is_5:
-            _set_color(tl, 'frame_current', p["playhead_color"])
-            _set_color(tl, 'time_scrub_background', _rgba(p["ui_panel"], 0.75))
-            _set_color(tl, 'time_marker_line', _rgba(p["warning"], 0.5))
-            _set_color(tl, 'time_marker_line_selected', _rgba(p["ui_accent"], 0.8))
-    except AttributeError:
-        pass
-
-    # =====================================================================
     # CONSOLE
     # =====================================================================
     set_space_generic(theme.console.space)
@@ -920,11 +1001,8 @@ def apply_theme_to_blender(palette):
     inf = theme.info
     _set_color(inf, 'info_selected', p["ui_selection"])
     _set_color(inf, 'info_selected_text', p["ui_selection_text"])
-    _set_color(inf, 'info_error', _rgba(p["danger"], 0.3))
     _set_color(inf, 'info_error_text', p["danger"])
-    _set_color(inf, 'info_warning', _rgba(p["warning"], 0.3))
     _set_color(inf, 'info_warning_text', p["warning"])
-    _set_color(inf, 'info_info', _rgba(p["info_color"], 0.3))
     _set_color(inf, 'info_info_text', p["info_color"])
     _set_color(inf, 'info_debug', _rgba(p["accent_tertiary"], 0.3))
     _set_color(inf, 'info_debug_text', p["accent_tertiary"])
@@ -995,8 +1073,6 @@ def apply_theme_to_blender(palette):
     _set_color(ie, 'paint_curve_pivot', p["danger"])
     _set_color(ie, 'paint_curve_handle', p["success"])
     _set_color(ie, 'uv_shadow', _rgba(p["ui_text_disabled"], 0.3))
-    _set_color(ie, 'stitch_indicator_active', p["success"])
-    _set_color(ie, 'stitch_indicator_disconnected', p["danger"])
 
     # =====================================================================
     # SEQUENCE EDITOR
@@ -1036,7 +1112,6 @@ def apply_theme_to_blender(palette):
     _set_color(ce, 'marker', p["ui_accent"])
     _set_color(ce, 'active_marker', p["obj_active"])
     _set_color(ce, 'selected_marker', p["obj_selected"])
-    _set_color(ce, 'dis_marker', p["ui_text_disabled"])
     _set_color(ce, 'locked_marker', p["danger"])
     _set_color(ce, 'handle_vertex', p["vertex_color"])
     _set_color(ce, 'handle_vertex_select', p["edge_select"])
@@ -1058,31 +1133,30 @@ def apply_theme_to_blender(palette):
     # =====================================================================
     if _is_5:
         # --- Regions: Sidebars ---
-        sb = theme.regions.sidebars
+        sb = _struct(theme, 'regions.sidebars')
         _set_color(sb, 'back', _rgba(p["ui_bg"], 0.0))
         _set_color(sb, 'tab_back', _rgba(p["ui_bg"], tabs_alpha))
 
         # --- Regions: Channels ---
-        ch = theme.regions.channels
+        ch = _struct(theme, 'regions.channels')
         _set_color(ch, 'back', p["ui_bg"])
 
 
         # --- Regions: Scrubbing / Markers ---
-        scr = theme.regions.scrubbing
+        scr = _struct(theme, 'regions.scrubbing')
         _set_color(scr, 'back', _rgba(p["ui_panel"], 0.75))
         _set_color(scr, 'text', p["ui_text_muted"])
         _set_color(scr, 'time_marker', _rgba(p["warning"], 0.5))
         _set_color(scr, 'time_marker_selected', _rgba(p["ui_accent"], 0.8))
 
         # --- Regions: Asset Shelf ---
-        ash = theme.regions.asset_shelf
+        ash = _struct(theme, 'regions.asset_shelf')
         _set_color(ash, 'header_back', p["header_bg"])
         _set_color(ash, 'back', p["ui_bg"])
 
         # --- Common: Animation ---
-        anim = theme.common.anim
+        anim = _struct(theme, 'common.anim')
         _set_color(anim, 'playhead', p["playhead_color"])
-        _set_color(anim, 'summary', _rgba(p["ui_accent"], chan_a))
         _set_color(anim, 'preview_range', _rgba(p["ui_accent"], 0.3))
         # Common > Animation: exact palette colours, no synthesized alpha.
         _set_color(anim, 'channels', p["anim_channels"])
@@ -1107,7 +1181,7 @@ def apply_theme_to_blender(palette):
         _set_color(anim, 'long_key_selected', _rgba(p["bright_magenta"], 0.3))
 
         # --- Common: Curves (handles) ---
-        crv = theme.common.curves
+        crv = _struct(theme, 'common.curves')
         _set_color(crv, 'handle_free', p["danger"])
         _set_color(crv, 'handle_sel_free', p["danger"])
         _set_color(crv, 'handle_auto', p["success"])
@@ -1160,4 +1234,9 @@ def apply_theme_to_blender(palette):
         for area in getattr(screen, 'areas', ()):
             area.tag_redraw()
 
+    if _DEBUG and _skipped:
+        print("Palette Studio: %d theme fields not in Blender %s:" % (
+            len(_skipped), bpy.app.version_string))
+        for name in sorted(_skipped):
+            print("  " + name)
     return True

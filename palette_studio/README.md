@@ -1,6 +1,6 @@
 # Palette Studio
 
-**Public hotfix: `1.2.1`.** iTerm2 is the default main collection for new preferences; existing saved source choices and the optional Noctalia default are unchanged. The empty header no longer shows the palette-count message.
+**Version `1.2.2`.** Adds Blender 5.3 support, Restore Previous Theme and several fixes (see the 1.2.2 notes below). Builds on 1.2.1, where iTerm2 became the default main collection for new preferences; existing saved source choices and the optional Noctalia default are unchanged.
 
 A full workspace rework with a
 current-palette hero card and a slim, read-only ANSI 0–7 preview, larger icon navigation,
@@ -71,7 +71,7 @@ Finetune controls are arranged into four collapsible groups: Interface, Fonts & 
 - **Inset** — darker, recessed panel surfaces and lighter controls.
 - **Accent** — Card-like surfaces with restrained primary-accent tint on panel and editor headers.
 
-All styles use flat controls without emboss, set toolbar/sidebar background alpha to 0.0 and derive restrained surface shades from the palette. Shades/tints adapt to light/dark backgrounds and are reduced if they would compromise source text contrast. Palette swatches, accents, viewport object/axis/animation colors and the viewport canvas are not recolored by surface styling. Custom Background 1/2 picks bypass generated RGB shades and tints, custom text wins, and outline picks remain editable. Selecting a style sets Roundness; manual tweaks persist until the next style selection. Default seeds all three outlines to Background; Outlined seeds Outline 2/3 to Foreground; the other styles leave picks unchanged. Default now means the Layered treatment, not restoration of the old appearance or native gradients. Save Preferences keeps the choice; Save Palette Preset captures the visible styling. Without a loaded palette, choosing a style only prepares the preference for the next palette—it does not repaint a native preset. The original Default, Soft and Accent Wash are removed in 1.2.8-beta; their saved selections migrate to the new Default without changing Blender's saved appearance at startup. Minimal and Shaded were removed earlier. Saved Layered selections keep their appearance and are now labeled Default.
+All styles use flat controls without emboss, set toolbar/sidebar background alpha to 0.0 and derive restrained surface shades from the palette. Shades/tints adapt to light/dark backgrounds and are reduced if they would compromise source text contrast. Palette swatches, accents, viewport object/axis/animation colors and the viewport canvas are not recolored by surface styling. Custom Background 1/2 picks bypass generated RGB shades and tints, custom text wins, and outline picks remain editable. Selecting a style sets Roundness; manual tweaks persist until the next style selection. Default seeds all three outlines to Background; Outlined seeds Outline 2/3 to Foreground; the other styles leave picks unchanged. Default now means the Layered treatment, not restoration of the old appearance or native gradients. Save Preferences keeps the choice; Save Palette Preset captures the visible styling. Without a loaded palette, choosing a style only prepares the preference for the next palette—it does not repaint a native preset. The original Default, Soft and Accent Wash are removed; their saved selections migrate to the new Default without changing Blender's saved appearance at startup. Minimal and Shaded were removed earlier. Saved Layered selections keep their appearance and are now labeled Default.
 
 **Interface**
 
@@ -122,117 +122,25 @@ A couple of deliberate choices: in Edit Mode, unselected edges and vertex dots u
 ### Save Palette Preset
 On the Palette page. Load or edit a palette, click it, give it a name, and Blender saves it as a normal theme preset. If the name already exists, the dialog warns you and asks for overwrite confirmation. The native writer stages a UUID-named XML, validates it, and only then replaces the user preset. Existing presets are backed up under `~/Documents/Backup/Agent Backup/Palette Studio Presets`; a write, validation, backup or replacement failure preserves the original. Built-in and extension presets cannot be overwritten: choose a new name.
 
+### 1.2.2 — Blender 5.3 support and review fixes
+
+- Works on Blender 4.5 LTS, 5.2 LTS and 5.3. Blender 5.3 removed a few theme colors (editor header text and title colors, the File Browser selected-file color); Palette Studio skips what a version does not have and keeps everything else.
+- **Restore Previous Theme** (Settings) returns to the theme Blender showed before the first palette was applied.
+- Noctalia dark and light variants are starred independently; older favorites keep working.
+- Turning a global Text or Text Selected override off, with no palette loaded, brings back the theme's own colors.
+- A palette that fails to load now shows the reason in the header card instead of failing silently.
+- Downloads: old download logs are pruned (the newest five are kept), and a refresh where every source fails is reported as an error.
+- The unused Local-folder source mode and a few hidden legacy settings were removed. Your files are never touched.
+- Developer option: start Blender with `PALETTE_STUDIO_DEBUG=1` to print the theme fields the running Blender version does not have.
+
 ### 1.2.1 — default source and header hotfix
 
 - Enables iTerm2 and disables NvChad by default for new preferences, without changing saved source choices or the Noctalia default.
 - Removes the "1000+ palettes, ready to explore." message from the empty header.
 
-### 1.2.0 — public release candidate
+### 1.2.0 — workspace cleanup
 
-Promotes the tested 1.2.100-beta behavior without changing theme application or saved preferences. Manifest, User-Agent, footer and release ZIP use untagged version 1.2.0. Not yet published.
-
-### Development history
-
-The versions below describe earlier development builds, not the current package version.
-
-### 1.2.100-beta — tab cleanup
-
-- Removed Channel Text controls from Finetune and the source/apply hint beneath Browse.
-- Settings keeps unboxed Download/Unload buttons and an optional Noctalia sync button, without extra section headings or explanatory messages. Download progress and Cancel remain available.
-
-### 1.2.99-beta — cleaner Palette page
-
-Removes the Color Workbench header and slot count from the Palette page, so the
-Base Colors / ANSI groups start at the top. Quick Adjust stays expanded by
-default for new profiles, and saved fold choices still win.
-
-### 1.2.98-beta — palette restore and animation colors
-
-Restores the last selected palette into the Palette page after a restart without
-re-applying the theme. Common > Animation maps Channels to bright blue,
-Sub-channels to blue, Active Channel Group to bright green and Channel Group to
-green; the Blender 4.5 per-editor channel groups use the same greens. Selected
-Dope Sheet/Timeline keyframe borders use the palette foreground at full opacity.
-The eight-color header preview uses a read-only color property, so it stays
-non-editable but renders at full palette brightness.
-
-### 1.2.97-beta — slim palette preview
-
-The header now shows one thin row of eight read-only colors, matching the SOL
-reference build. Header color editing and the click-to-tweak hint are removed.
-All 20 colors remain editable on Palette; other UI and theme behavior stay unchanged.
-
-### 1.2.96-deep-beta — full UI rework
-
-A presentation-only workspace rework: current-palette hero card with an editable
-ANSI color ribbon, larger icon navigation, search-first Browse with filter pills
-and a **Surprise Me** random-palette button, two-column color tiles on Palette,
-five Look Style tiles on Finetune, and boxed two-column Settings cards. Saved
-page IDs, fold defaults, RNA identifiers, property callbacks and theme behavior
-are unchanged.
-
-### 1.2.95 — release candidate
-
-Combines the validated 1.2.94 viewport backgrounds and 1.2.95 Fonts & Text work on `main`, with earlier UI, Settings and Look Style improvements retained. Manifest, User-Agent, UI footer and ZIP filename use untagged version 1.2.95. Not yet published.
-
-### 1.2.95-beta — Fonts & Text
-
-Adds Finetune → Fonts & Text, initially collapsed, with Blender's native Interface Font file selector and all existing font/text overrides. Moves Font Size, Shadow and global text colors out of Interface, and channel text colors out of Animation, without changing saved identifiers, callbacks or override precedence. The native Interface Font setting is global, works without a loaded palette, and persists through Blender's Save Preferences; it is not a per-palette override or a theme XML font path.
-
-### 1.2.94-beta — viewport backgrounds and Finetune
-
-Appearance becomes Finetune (saved page ID unchanged). Adds Static/Gradient/Vignette viewport background modes and independent custom A/B RGB overrides, defaulting to palette Background and Black (ANSI 0). B and Swap appear only for non-static modes; Swap enables both overrides. Unticked defaults follow palette edits, while custom colors persist across palettes/modes. Viewport colors no longer follow Interface Background 1. Moves Show Hex and Quick Adjust below all color rows, with Quick Adjust expanded by default for new profiles. Saved fold preferences remain intact.
-
-### 1.2.93-beta — simpler Settings
-
-Settings is split into Sources, Noctalia Sync and Blender Theme disclosures. Removes Location (Remote/Local) and the local-folder picker; old Local preferences migrate to Remote without touching local files or applying a theme at startup. Download and Unload are always visible, with Unload immediately below Download, keeping its running-job guard, deletion warning and confirmation. Removes the Cache disclosure. Save Preferences uses the save icon. Existing hidden local-mode fields/backend remain for saved-data compatibility, not as user-facing options.
-
-### 1.2.92-beta — tool and scrollbar accents
-
-All five styles now use Primary at alpha 0.5 for Themes → User Interface → Tool → Selected, Tertiary for Scroll Bar → Item, and Icons → Border intensity 0.0. These follow the live Primary/Tertiary picks; changing palettes keeps the same role bindings. Icon category colors and full icon opacity/saturation are unchanged.
-
-### 1.2.91-beta — Browse stars and Default polish
-
-Moves favorites to clickable stars on list rows, removes Browse's Favorite/Edit Palette buttons, and moves native Blender Presets from Settings to the bottom of Browse, including empty-library states. Star clicks preserve the active palette and edits even during Favorites First reordering. Default uses Background for Outline 1/2/3, transparent navigation/tabs backgrounds, and raw palette Background/Foreground for Outliner Active/Selected Objects. Reselect Default after upgrading to adopt its outline picks; startup does not overwrite saved picks or repaint the theme.
-
-All styles now share keyframe-border alpha 0.0 in Dope Sheet/Timeline, editor-outline Primary at alpha 0.1, and Text Item = Secondary at alpha 0.3, Selected Text = palette Foreground, Inner Selected = palette Background. Outlined keeps Foreground Outline 2/3 and opaque panels; other styles keep their existing surface treatments. Global text overrides remain authoritative. Version 1.2.91 explicitly requested by the user.
-
-### 1.2.9-beta — transparent regions and Outlined borders (historical)
-
-Rebuilt at the user's request with Outlined panel/subpanel background alpha 1.0, while toolbar/sidebar backgrounds remain alpha 0.0. The version and ZIP filename remain 1.2.9-beta; the earlier ZIP was backed up before replacement.
-
-Every Look Style now uses transparent toolbar/sidebar backgrounds (alpha 0.0), through unified Regions on Blender 5.2 and per-editor backgrounds on 4.5. Selecting Outlined sets Outline 2 and Outline 3 to Foreground. Manual outline picks remain editable and survive palette changes; other styles leave the picks unchanged. Saved Outlined users should reselect the style to adopt these defaults; startup does not rewrite saved picks or repaint the theme.
-
-### 1.2.8-beta — Layered becomes Default
-
-Removes the old Default, Soft and Accent Wash; renames Layered to Default and makes it the initial selection. Default uses separated surface tones and 0.5 Roundness. Surviving styles keep stable saved IDs. Removed selections migrate without startup theme writes; the old native-gradient/roundness restoration path is removed. Native Blender preset saving and restore remain available in Settings.
-
-### 1.2.7-beta — more Look Styles (historical)
-
-Keeps Default and Card and adds Soft, Outlined, Inset, Accent, Layered and Accent Wash. Minimal and Shaded are removed; saved Card values remain compatible, while removed selections fall back to Default without startup theme writes. Surface tints use the same contrast guard as shades and do not change the source palette or semantic colors.
-
-### 1.2.6-beta — Look Styles (historical)
-
-Default, Minimal, Shaded and Card surface treatments in Appearance. Pure UI-only shading preserves source palettes, semantic colors and custom picks. Repeated switches back to Default restore native widget gradients and earlier roundness. Native preset selection clears the old gradient baseline; style selection without a loaded palette leaves the native theme alone. Includes dark/light, contrast, overrides, preset XML and exact Default-restoration regressions.
-
-### 1.2.5-beta — icon colors and search
-
-The list search stays expanded, without a duplicate top search bar. Scene and Collection icons use palette blue, Object yellow, Object Data green, Modifier bright cyan, and Shading magenta. Light palettes disable icon borders; dark palettes retain full borders.
-
-### 1.2.4-beta — minimal UI
-Quieter header and navigation, fewer decorative boxes, compact Browse filters, optional hex fields and collapsible Quick Adjust. Appearance groups start collapsed in new profiles. Configure is now Settings, with expandable Cache and Blender Presets sections. Save Preset stays with palette editing; Restore Blender Theme moves to Settings. All existing features remain accessible.
-
-### 1.2.3-beta — review fixes
-Startup list restoration no longer applies a theme. Native preset reset detaches the palette, cancels pending work and restores state on unregister. Missing optional cursor/selection colors consistently fall back to ANSI 15/ANSI 4, preserving the tertiary fallback when optional data is absent; global text overrides have consistent precedence. Remote and local caches use separate `theme_index.json` and `theme_index_local.json` indexes, and switching modes can use cached data without a download. Lua comments are stripped, and only parseable palettes may be staged.
-
-Remote downloads and local scans are asynchronous in a separate Blender process polled by a timer. Cancellation is cooperative and checked before index publication; network cancellation may wait for the socket timeout or current scan, and the process is not hard-killed. Job logs are retained in the cache job directory. Offline parser/cache (22 checks), subprocess (10 checks), color math, and all eight isolated Blender suites pass on 4.5.8 and 5.2.1. Both GUI screenshot harnesses pass; representative Configure screenshots were reviewed. Manual interaction/restart testing and real upstream downloads remain to be tested.
-
-### 1.2.2-beta camera passepartout and icon borders
-
-The camera passepartout (the dimmed area outside the camera frame in the 3D viewport) is no longer derived from the palette: it is a persistent Appearance → Viewport color pick that defaults to black and survives every palette apply, palette alpha tweaks and background overrides. Icon borders are forced back to full intensity (`icon_border_intensity` 1.0), where earlier builds muted them to 0. Regression coverage grew to 16 checks, including default black, a light-palette independence check, live custom picks and preference snapshots.
-
-### 1.2.1-beta audit corrections
-Browser search, sorting, favorites and source filters rebuild the list without discarding palette edits. Startup restores the cached browser list once outside UI drawing, even when filters yield an empty list; unavailable selections remain unselected. Noctalia source selection and configuration cache invalidation, YAML format detection, and rejection of files without recognized colors are corrected. Source alpha is combined with intentional per-field alpha without changing RGB. Downloads stage complete source snapshots, and validated JSON indexes are replaced atomically; the replaced copies are kept until the new index is published, so a failed refresh (including an index write failure) restores the previous cache. Isolated smoke, UI-contract and audit regression checks pass on Blender 4.5.8 and 5.2.1; the GUI harness captured all four pages, dark/light palettes and Preferences without draw errors, and representative screenshots were reviewed. Real network downloads and native Windows testing remain outstanding.
+Public release of the tab-cleanup workspace; theme application and saved preferences are unchanged.
 
 ### 1.1.0 public baseline
 Version **1.1.0** maps Common → Animation → Channels to the palette cyan and Sub-channels to bright cyan. It also keeps the Channels text mapping, remembered palette selection, and earlier widget-state mappings.
@@ -256,7 +164,7 @@ That is plenty to get started. Nothing is bundled with the add-on; the files are
 
 ## Requirements
 
-- Blender 4.5 or newer (4.5 LTS and 5.x both work)
+- Blender 4.5 or newer (tested on 4.5 LTS, 5.2 LTS and 5.3)
 - An internet connection for the first download
 
 ## License

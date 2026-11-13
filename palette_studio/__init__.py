@@ -33,7 +33,6 @@ import bpy
 import colorsys
 import json
 import os
-import shutil
 import uuid
 import traceback
 import xml.etree.ElementTree as ET
@@ -84,18 +83,6 @@ if _needs_reload:
 
 # Defined in palette_slots.py so prefs.py can import them without a cycle.
 PALETTE_SLOTS = palette_slots.PALETTE_SLOTS
-
-# Friendly display names for the source key stored on each indexed theme.
-_SOURCE_LABELS = {
-    "nvchad": "NvChad",
-    "iterm": "iTerm2",
-    "base24": "base24",
-    "kitty": "kitty",
-    "alacritty": "Alacritty",
-    "noctalia": "Noctalia",
-    "base16": "base16",
-    "local": "Local",
-}
 
 
 def _hex_from_rgb(r, g, b):
@@ -369,6 +356,9 @@ _FINETUNE_COLOR_PROPS = (
 )
 
 
+_ACCENT_ROLES = ("accent_primary", "accent_secondary", "accent_tertiary")
+
+
 def _slot_color(theme, slot_id):
     """Resolve a palette slot id ("ansi_3", "selection", …) to RGB in a
     normalized theme dict. Returns None when the slot is missing/empty.
@@ -502,7 +492,13 @@ def _apply_accent_overrides(theme, addon_prefs, reset_axes=True):
     # Finetune colours may point at an accent role, so this runs after the
     # accent loop above has filled them in.
     for key, prop in _FINETUNE_COLOR_PROPS:
-        color = _slot_color(theme, getattr(addon_prefs, prop, None))
+        pick = getattr(addon_prefs, prop, None)
+        color = _slot_color(theme, pick)
+        if not color and pick in _ACCENT_ROLES:
+            # The accent itself fell back (e.g. Tertiary -> Selection -> ANSI 5
+            # in a palette without a selection colour): follow that fallback
+            # instead of this control's own unrelated default.
+            color = color_roles.resolve_slot(theme, pick)
         if color:
             theme[key] = color
     return theme
@@ -555,7 +551,7 @@ def _build_theme_from_palette(wm, addon_prefs=None, reset_axes=True):
 # =========================================================================
 
 class PALETTE_STUDIO_OT_refresh_repo(Operator):
-    """Refresh the theme list from local folder or remote repositories"""
+    """Download the enabled palette sources in the background"""
     bl_idname = "palette_studio.refresh_repo"
     bl_label = "Refresh Theme List"
     bl_options = {'REGISTER'}
@@ -570,11 +566,6 @@ class PALETTE_STUDIO_OT_refresh_repo(Operator):
                         "A palette download is already running. Use Cancel to stop it.")
             return {'CANCELLED'}
 
-        job_mode = 'local' if addon_prefs.source_mode == 'LOCAL' else 'remote'
-        index_mode = repo.INDEX_LOCAL if job_mode == 'local' else repo.INDEX_REMOTE
-        folder = None
-        enabled = None
-
         try:
             cache_dir = repo.get_cache_dir()
         except Exception as e:
@@ -582,21 +573,15 @@ class PALETTE_STUDIO_OT_refresh_repo(Operator):
             traceback.print_exc()
             return {'CANCELLED'}
 
-        if job_mode == 'local':
-            folder = bpy.path.abspath(addon_prefs.local_folder)
-            if not folder or not os.path.isdir(folder):
-                self.report({'ERROR'}, f"Invalid folder: {folder}")
-                return {'CANCELLED'}
-        else:
-            # Respect Blender's online access setting (required for extensions platform)
-            if not bpy.app.online_access:
-                self.report({'ERROR'},
-                    "Online access is disabled. Enable in Preferences > System > Network.")
-                return {'CANCELLED'}
-            enabled = addon_prefs.get_enabled_sources()
-            if not enabled:
-                self.report({'ERROR'}, "No sources enabled. Check add-on preferences.")
-                return {'CANCELLED'}
+        # Respect Blender's online access setting (required for extensions platform)
+        if not bpy.app.online_access:
+            self.report({'ERROR'},
+                "Online access is disabled. Enable in Preferences > System > Network.")
+            return {'CANCELLED'}
+        enabled = addon_prefs.get_enabled_sources()
+        if not enabled:
+            self.report({'ERROR'}, "No sources enabled. Turn one on in Settings > Sources.")
+            return {'CANCELLED'}
 
         def _on_finished(result):
             # Runs on Blender's main thread from the coordinator's timer.
@@ -604,28 +589,25 @@ class PALETTE_STUDIO_OT_refresh_repo(Operator):
                 live = bpy.context.preferences.addons[__package__].preferences
             except Exception:
                 return
-            # If the user switched modes while the job ran, the mode handler
-            # already rebuilt that mode's index: never overwrite the list with
-            # a stale result, and never auto-apply a palette.
-            current = 'local' if live.source_mode == 'LOCAL' else 'remote'
-            if current != job_mode or result.get("status") != "ok":
+            # A partial refresh still published new palettes, so list them.
+            # Never auto-apply a palette from here.
+            if result.get("status") not in ("ok", "partial"):
                 return
             try:
-                repo.ensure_index_flags(index_mode)
-                themes = repo.get_theme_list(index_mode)
+                repo.ensure_index_flags()
+                themes = repo.get_theme_list()
                 if not themes:
                     live.themes_loaded = False
                     return
                 live.themes_loaded = True
-                _populate_theme_list(bpy.context.window_manager, themes,
-                                     apply_selection=False)
+                _populate_theme_list(bpy.context.window_manager, themes)
                 prefs._redraw_after_apply()
             except Exception:
                 traceback.print_exc()
 
         try:
             started = download_job.start(
-                job_mode, cache_dir=cache_dir, folder=folder,
+                'remote', cache_dir=cache_dir,
                 enabled_sources=enabled, on_finished=_on_finished,
             )
         except Exception as e:
@@ -637,9 +619,7 @@ class PALETTE_STUDIO_OT_refresh_repo(Operator):
             self.report({'WARNING'}, "A palette download is already running.")
             return {'CANCELLED'}
 
-        self.report({'INFO'},
-                    "Scanning local palettes in the background." if job_mode == 'local'
-                    else "Downloading palettes in the background. Use Cancel to stop.")
+        self.report({'INFO'}, "Downloading palettes in the background. Use Cancel to stop.")
         return {'FINISHED'}
 
 
@@ -648,6 +628,16 @@ class PALETTE_STUDIO_OT_unload_themes(Operator):
     bl_idname = "palette_studio.unload_themes"
     bl_label = "Unload"
     bl_options = {'REGISTER'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(
+            self, event,
+            title="Unload Palettes?",
+            message="Deletes the downloaded palette files. Your Blender theme, "
+                    "presets and favourites are kept. Download again any time.",
+            confirm_text="Unload",
+            icon='WARNING',
+        )
 
     def execute(self, context):
         if download_job.is_running():
@@ -664,9 +654,7 @@ class PALETTE_STUDIO_OT_unload_themes(Operator):
         # from an index we are about to delete.
         addon_prefs.themes_loaded = False
 
-        removed = 0
-        if addon_prefs.source_mode == 'REMOTE':
-            removed = repo.clear_cache()
+        removed = repo.clear_cache()
 
         wm.palette_studio_theme_search = ""
         wm.palette_studio_themes.clear()
@@ -700,6 +688,7 @@ class PALETTE_STUDIO_OT_load_palette(Operator):
         try:
             palette_theme = iterm_parser.parse_theme_file(
                 theme_item.path, theme_item.variant)
+            _snapshot_before_first_apply(context)
             _populate_palette_from_theme(wm, palette_theme)
             if not prefs._reapply_loaded_palette(context, reset_axes=True):
                 raise RuntimeError("Could not apply the reloaded palette")
@@ -766,11 +755,6 @@ def _save_theme_preset(context, name, existing_path=None):
             raise OSError("Blender could not write the theme preset")
         if ET.parse(pending_path).getroot().tag != 'bpy':
             raise ValueError("Blender produced an invalid theme preset")
-        if existing_path:
-            backup_root = os.path.expanduser('~/Documents/Backup/Agent Backup/Palette Studio Presets')
-            os.makedirs(backup_root, exist_ok=True)
-            shutil.copy2(target, os.path.join(
-                backup_root, filename + '-' + uuid.uuid4().hex + '.xml'))
         os.replace(pending_path, target)
         published = True
         theme.filepath = target
@@ -907,11 +891,14 @@ def detach_loaded_palette(context):
     wm.palette_studio_palette_loaded = False
     wm.palette_studio_palette.clear()
     wm.palette_studio_palette_theme_name = ''
+    wm.palette_studio_last_error = ''
     addon_prefs = context.preferences.addons[__package__].preferences
     addon_prefs.last_selected_theme_path = ''
     addon_prefs.last_selected_theme_variant = ''
     # A newly chosen native preset owns its gradients, not the previous palette.
     addon_prefs.look_style_shading_defaults = ''
+    # ...and its own text colours: a saved native text snapshot is stale.
+    addon_prefs.native_text_snapshot = ''
     _suppress_theme_selection = True
     try:
         wm.palette_studio_theme_active = -1
@@ -949,6 +936,109 @@ def _remove_native_theme_hook():
             menu.reset_cb = staticmethod(_native_reset_previous)
 
 
+# ------------------------------------------------------------------
+# Restore Previous Theme: the theme Blender showed before a palette was applied
+# ------------------------------------------------------------------
+_THEME_PRESET_MENU = "USERPREF_MT_interface_theme_presets"
+_PREVIOUS_THEME_FILE = "previous_theme.xml"
+_PREVIOUS_THEME_META = "previous_theme.json"
+
+
+def _previous_theme_dir(create=False):
+    """Private folder (extension user data, not the preset menu or the cache)."""
+    try:
+        return bpy.utils.extension_path_user(__package__, path="previous_theme", create=create)
+    except Exception:
+        return None
+
+
+def has_previous_theme():
+    folder = _previous_theme_dir()
+    return bool(folder) and os.path.isfile(os.path.join(folder, _PREVIOUS_THEME_FILE))
+
+
+def _rna_xml():
+    """Blender's theme XML writer (renamed to ``_rna_xml`` in Blender 5.x)."""
+    try:
+        import _rna_xml as module
+    except ImportError:
+        import rna_xml as module
+    return module
+
+
+def snapshot_previous_theme(context):
+    """Store the current theme before a palette replaces it (best effort).
+
+    Only called while no palette is loaded, i.e. Blender shows a native or
+    restored theme. Uses Blender's own preset XML writer, written atomically,
+    so "Restore Previous Theme" loads it exactly like a theme preset.
+    """
+    try:
+        folder = _previous_theme_dir(create=True)
+        if not folder:
+            return False
+        menu = getattr(bpy.types, _THEME_PRESET_MENU)
+        target = os.path.join(folder, _PREVIOUS_THEME_FILE)
+        pending = target + ".tmp"
+        _rna_xml().xml_file_write(context, pending, menu.preset_xml_map)
+        if ET.parse(pending).getroot().tag != 'bpy':
+            raise ValueError("invalid theme snapshot")
+        os.replace(pending, target)
+        meta = os.path.join(folder, _PREVIOUS_THEME_META)
+        with open(meta + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump({"filepath": context.preferences.themes[0].filepath}, handle)
+        os.replace(meta + ".tmp", meta)
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _snapshot_before_first_apply(context):
+    """Snapshot once per detached state: the first palette apply only."""
+    try:
+        if context.window_manager.palette_studio_palette_loaded:
+            return
+    except Exception:
+        return
+    snapshot_previous_theme(context)
+
+
+class PALETTE_STUDIO_OT_restore_previous_theme(Operator):
+    """Return to the theme Blender showed before a palette was applied"""
+    bl_idname = "palette_studio.restore_previous_theme"
+    bl_label = "Restore Previous Theme"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_previous_theme()
+
+    def execute(self, context):
+        folder = _previous_theme_dir()
+        path = os.path.join(folder, _PREVIOUS_THEME_FILE)
+        try:
+            with open(os.path.join(folder, _PREVIOUS_THEME_META), "r", encoding="utf-8") as handle:
+                original = str(json.load(handle).get("filepath") or "")
+        except (OSError, ValueError, AttributeError):
+            original = ""
+        cancel_live_apply()
+        # Blender's own preset loader: resets the theme, then loads the XML.
+        # Its reset hook also detaches the loaded palette (see reset_cb).
+        result = bpy.ops.script.execute_preset(filepath=path, menu_idname=_THEME_PRESET_MENU)
+        if result != {'FINISHED'}:
+            self.report({'ERROR'}, "Could not restore the previous theme")
+            return {'CANCELLED'}
+        detach_loaded_palette(context)
+        # Show the preset name the user had, not our private snapshot file.
+        context.preferences.themes[0].filepath = original
+        menu = getattr(bpy.types, _THEME_PRESET_MENU)
+        menu.bl_label = bpy.path.display_name(os.path.basename(original)) if original else "Presets"
+        prefs._redraw_after_apply()
+        self.report({'INFO'}, "Previous theme restored")
+        return {'FINISHED'}
+
+
 class PALETTE_STUDIO_OT_restore_theme(Operator):
     """Restore Blender's theme and detach the previously loaded palette"""
     bl_idname = "palette_studio.restore_theme"
@@ -961,24 +1051,6 @@ class PALETTE_STUDIO_OT_restore_theme(Operator):
         if result == {'FINISHED'}:
             detach_loaded_palette(context)
         return result
-
-
-class PALETTE_STUDIO_OT_search_themes(Operator):
-    """Filter the theme list by search term"""
-    bl_idname = "palette_studio.search"
-    bl_label = "Search Themes"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        from . import repo
-
-        wm = context.window_manager
-        query = wm.palette_studio_theme_search
-
-        all_themes = repo.get_theme_list(_index_mode_for(context))
-        filtered = repo.search_themes(query, all_themes)
-        _populate_theme_list(wm, filtered)
-        return {'FINISHED'}
 
 
 class PALETTE_STUDIO_OT_preview_swatches(Operator):
@@ -1010,10 +1082,7 @@ class PALETTE_STUDIO_OT_preview_swatches(Operator):
             print(f"  Dark theme: {palette['dark']}")
             print("  ANSI Colors:")
             for i, c in enumerate(palette['ansi']):
-                hexc = "#{:02x}{:02x}{:02x}".format(
-                    int(c[0]*255), int(c[1]*255), int(c[2]*255)
-                )
-                print(f"    [{i:2d}] {hexc}")
+                print(f"    [{i:2d}] {_hex_from_rgb(*c[:3])}")
             print("  Derived palette:")
             print(summary)
             self.report({'INFO'}, f"Preview printed to console for: {theme_item.name}")
@@ -1034,6 +1103,7 @@ class PALETTE_STUDIO_OT_sync_noctalia(Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
+        global _suppress_theme_selection
         from . import repo, iterm_parser, blender_theme_map, apply
 
         found = repo.noctalia_sync_source()
@@ -1058,10 +1128,22 @@ class PALETTE_STUDIO_OT_sync_noctalia(Operator):
             addon_prefs = context.preferences.addons[__package__].preferences
             _apply_accent_overrides(palette_theme, addon_prefs)
             palette = blender_theme_map.build_palette(palette_theme)
+            _snapshot_before_first_apply(context)
             apply.apply_theme_to_blender(palette)
             # Same order as picking a theme in the browser: apply first, then
             # refill the Palette Editor so both show the same colours.
-            _populate_palette_from_theme(context.window_manager, palette_theme)
+            wm = context.window_manager
+            _populate_palette_from_theme(wm, palette_theme)
+            # The synced palette is not a browser entry: drop the previous
+            # selection so Reload and the next restart do not bring it back.
+            addon_prefs.last_selected_theme_path = ''
+            addon_prefs.last_selected_theme_variant = ''
+            wm.palette_studio_last_error = ''
+            _suppress_theme_selection = True
+            try:
+                wm.palette_studio_theme_active = -1
+            finally:
+                _suppress_theme_selection = False
         except Exception as e:  # noqa: BLE001 - report anything, never crash
             self.report({'ERROR'}, f"Sync failed: {e}")
             return {'CANCELLED'}
@@ -1077,25 +1159,47 @@ class PALETTE_STUDIO_OT_toggle_favourite(Operator):
     bl_options = {'REGISTER'}
 
     theme_path: StringProperty(options={'SKIP_SAVE'})
+    # Noctalia dark/light entries share one file; the variant tells them apart.
+    theme_variant: StringProperty(options={'SKIP_SAVE'})
 
     def execute(self, context):
         wm = context.window_manager
         from . import prefs as prefs_module
         selected = (next((item for item in wm.palette_studio_themes
-                          if item.path == self.theme_path), None)
+                          if item.path == self.theme_path
+                          and (not self.theme_variant or item.variant == self.theme_variant)),
+                         None)
                     if self.theme_path else prefs_module._selected_theme(wm))
         if selected is None:
             self.report({'WARNING'}, "Palette is no longer in the list")
             return {'CANCELLED'}
 
         selected_name, selected_path = selected.name, selected.path
+        variant = selected.variant
+        key = prefs_module.favorite_key(selected_path, variant)
         prefs = context.preferences.addons[__package__].preferences
         favorite_paths = prefs_module.get_favorite_paths()
-        if selected_path in favorite_paths:
-            favorite_paths.remove(selected_path)
+        if prefs_module.is_favorite(selected_path, variant, favorite_paths):
+            favorite_paths.discard(key)
+            if variant and selected_path in favorite_paths:
+                # A pre-1.2.2 (Nov 2026) favourite covered every variant of the file:
+                # keep the other variants starred, unstar only this one.
+                # The on-screen list may hide siblings (dark/light filter or
+                # search), so also read the variants from the file itself.
+                favorite_paths.discard(selected_path)
+                variants = {item.variant for item in wm.palette_studio_themes
+                            if item.path == selected_path}
+                try:
+                    from . import iterm_parser
+                    variants.update(iterm_parser.noctalia_variants(selected_path))
+                except Exception:
+                    pass
+                favorite_paths.update(
+                    prefs_module.favorite_key(selected_path, other)
+                    for other in variants if other and other != variant)
             message = "Removed from favourites"
         else:
-            favorite_paths.add(selected_path)
+            favorite_paths.add(key)
             message = "Added to favourites"
         prefs.favorite_theme_paths = json.dumps(sorted(favorite_paths))
 
@@ -1161,6 +1265,7 @@ class PALETTE_STUDIO_UL_theme_list(UIList):
         action = row.operator("palette_studio.toggle_favourite", text="", emboss=False,
                               icon='SOLO_ON' if item.favorite else 'SOLO_OFF')
         action.theme_path = item.path
+        action.theme_variant = item.variant
         if self.layout_type == 'GRID':
             return
         # Keep names readable at sidebar widths. Full source metadata lives
@@ -1208,8 +1313,8 @@ classes = (
     PALETTE_STUDIO_OT_load_palette,
     PALETTE_STUDIO_OT_save_theme,
     PALETTE_STUDIO_OT_reset_palette,
+    PALETTE_STUDIO_OT_restore_previous_theme,
     PALETTE_STUDIO_OT_restore_theme,
-    PALETTE_STUDIO_OT_search_themes,
     PALETTE_STUDIO_OT_preview_swatches,
     PALETTE_STUDIO_OT_sync_noctalia,
     PALETTE_STUDIO_OT_toggle_favourite,
@@ -1328,6 +1433,7 @@ def _on_theme_active_update(self, context):
             theme_item.path, theme_item.variant)
         _apply_accent_overrides(palette_theme, addon_prefs)
         palette = blender_theme_map.build_palette(palette_theme)
+        _snapshot_before_first_apply(context)
         apply.apply_theme_to_blender(palette)
         # Keep the Palette Editor in step with what was just applied. Safe to
         # call from here: the populate clears the loaded flag first, so the
@@ -1337,9 +1443,18 @@ def _on_theme_active_update(self, context):
         # filters can move a palette between sessions.
         addon_prefs.last_selected_theme_path = theme_item.path
         addon_prefs.last_selected_theme_variant = theme_item.variant
+        wm.palette_studio_last_error = ""
         # No XML export, no save - the selection itself is the apply.
-    except Exception:
-        traceback.print_exc()  # Keep browsing usable, but expose broken themes.
+    except Exception as ex:
+        # Keep browsing usable, but tell the user (update callbacks cannot
+        # report): the hero card shows this until the next successful apply.
+        # An unreadable palette file is expected; anything else is a bug.
+        if isinstance(ex, (OSError, ValueError)):
+            print("Palette Studio: could not read %s: %s" % (theme_item.path, ex))
+        else:
+            traceback.print_exc()
+        wm.palette_studio_last_error = "Could not apply %s: %s" % (
+            theme_item.name, str(ex) or type(ex).__name__)
 
 
 def _on_theme_search_update(self, context):
@@ -1362,7 +1477,7 @@ def _on_theme_search_update(self, context):
 
     query = wm.palette_studio_theme_search
 
-    all_themes = repo.get_theme_list(_index_mode_for(context))
+    all_themes = repo.get_theme_list()
     filtered = repo.search_themes(query, all_themes)
     _populate_theme_list(wm, filtered)
 
@@ -1378,19 +1493,15 @@ def _sort_themes(themes, sort_mode, favorite_paths=None):
     if sort_mode == 'FAVOURITES':
         return sorted(
             themes,
-            key=lambda t: (t.get("path", "") not in favorite_paths, t["name"].lower()),
+            key=lambda t: (not prefs.is_favorite(t.get("path", ""), t.get("variant", ""),
+                                                 favorite_paths),
+                           t["name"].lower()),
         )
     if sort_mode == 'POPULAR':
-        from .popular import POPULAR_THEMES
-        def _pop_rank(name):
-            name_lower = name.lower()
-            for i, pop in enumerate(POPULAR_THEMES):
-                if pop in name_lower:
-                    return i
-            return len(POPULAR_THEMES)  # non-popular goes after all popular
         # Popular themes ranked by their position in the curated list,
-        # non-popular themes alphabetically after
-        return sorted(themes, key=lambda t: (_pop_rank(t["name"]), t["name"].lower()))
+        # non-popular themes alphabetically after.
+        return sorted(themes, key=lambda t: (popular.popular_rank(t["name"]),
+                                             t["name"].lower()))
     elif sort_mode == 'AZ':
         return sorted(themes, key=lambda t: t["name"].lower())
     elif sort_mode == 'ZA':
@@ -1417,33 +1528,13 @@ def _filter_mode_for(context=None):
 
 
 def _source_filter_for(context=None):
-    """Enabled remote source keys, or None when source filtering is off.
-
-    Returns None in LOCAL mode (a single 'local' source) or when the
-    preferences are unavailable, so the caller can skip filtering.
-    """
+    """Enabled source keys, or None when the preferences are unavailable."""
     try:
         src = context if context is not None else bpy.context
         prefs = src.preferences.addons[__package__].preferences
     except Exception:
-        return None
-    if prefs.source_mode != 'REMOTE':
         return None
     return set(prefs.get_enabled_sources())
-
-
-def _index_mode_for(context=None):
-    """Index mode matching the source_mode preference (REMOTE by default).
-
-    LOCAL and REMOTE keep separate index files, so every reader resolves the
-    file that belongs to the mode currently selected in preferences.
-    """
-    try:
-        src = context if context is not None else bpy.context
-        prefs = src.preferences.addons[__package__].preferences
-    except Exception:
-        return repo.INDEX_REMOTE
-    return repo.INDEX_LOCAL if prefs.source_mode == 'LOCAL' else repo.INDEX_REMOTE
 
 
 def _filter_by_sources(themes, context=None):
@@ -1467,8 +1558,7 @@ def _filter_themes(themes, filter_mode):
     return themes
 
 
-def _populate_theme_list(wm, themes_list, sort_mode=None, filter_mode=None,
-                         apply_selection=False):
+def _populate_theme_list(wm, themes_list, sort_mode=None, filter_mode=None):
     """Rebuild presentation without applying a source or discarding edits."""
     global _suppress_theme_selection, _theme_list_initialized
     if sort_mode is None:
@@ -1497,7 +1587,8 @@ def _populate_theme_list(wm, themes_list, sort_mode=None, filter_mode=None,
         item.name = t["name"]
         item.path = t["path"]
         item.source = t.get("source", "")
-        item.favorite = t.get("path", "") in favorite_paths
+        item.favorite = prefs.is_favorite(t.get("path", ""), t.get("variant", ""),
+                                          favorite_paths)
         item.dark = bool(t.get("dark", True))
         item.variant = t.get("variant", "")
 
@@ -1512,8 +1603,6 @@ def _populate_theme_list(wm, themes_list, sort_mode=None, filter_mode=None,
     finally:
         _suppress_theme_selection = False
     _theme_list_initialized = True
-    if apply_selection and restored_index >= 0:
-        _on_theme_active_update(wm, bpy.context)
     return wm.palette_studio_theme_count
 
 
@@ -1553,19 +1642,16 @@ def _restore_theme_list_now(context):
     except (KeyError, AttributeError):
         return
 
-    mode = _index_mode_for(context)
-
     if not addon_prefs.themes_loaded:
         # Fall back to an existing cache when preferences were not saved on
-        # quit. Unload removes the remote cache, so this stays consistent; a
-        # LOCAL unload keeps its index and must stay unlisted too.
-        if mode == repo.INDEX_LOCAL or not repo.has_index(mode):
+        # quit. Unload removes the cache, so this stays consistent.
+        if not repo.has_index():
             return
 
     _ensuring_theme_list = True
     try:
-        repo.ensure_index_flags(mode)
-        themes = repo.get_theme_list(mode)
+        repo.ensure_index_flags()
+        themes = repo.get_theme_list()
         if not themes:
             addon_prefs.themes_loaded = False
             return
@@ -1578,7 +1664,7 @@ def _restore_theme_list_now(context):
         if query:
             themes = repo.search_themes(query, themes)
 
-        _populate_theme_list(wm, themes, apply_selection=False)
+        _populate_theme_list(wm, themes)
 
         # Bring the Palette Editor back with the remembered selection, but do
         # not re-apply the theme: the saved Blender appearance still wins.
@@ -1688,6 +1774,8 @@ def register():
         update=_on_theme_search_update,
     )
     bpy.types.WindowManager.palette_studio_theme_count = IntProperty(default=0)
+    # Last palette that failed to apply from the browser (shown in the hero card).
+    bpy.types.WindowManager.palette_studio_last_error = StringProperty(default="")
 
     # Palette editor
     bpy.types.WindowManager.palette_studio_palette = CollectionProperty(type=PALETTE_STUDIO_PaletteColor)
@@ -1751,6 +1839,7 @@ def unregister():
         "palette_studio_palette_theme_name",
         "palette_studio_palette_loaded",
         "palette_studio_palette",
+        "palette_studio_last_error",
         "palette_studio_theme_count",
         "palette_studio_theme_search",
         "palette_studio_theme_active",

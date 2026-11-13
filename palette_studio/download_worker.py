@@ -26,7 +26,7 @@ slow part in a separate *process* launched by :mod:`palette_studio.download_job`
 The process imports ``repo`` / ``iterm_parser`` through a synthetic package
 (``__path__`` pointing at the extension directory) so
 ``palette_studio/__init__.py`` - and therefore ``bpy`` - is never executed.
-It reads local palettes and writes the palette cache. Its own configuration,
+It writes the palette cache (and reads the user's local Noctalia schemes). Its own configuration,
 home and temporary directories are isolated under the job directory. Job IPC:
 
     request.json    written by the coordinator before launch (read here)
@@ -138,26 +138,13 @@ def _cancel_probe(job_dir):
     return lambda: os.path.exists(marker)
 
 
-def _run(repo, request, report):
-    """Download remote sources or scan a local folder, per the request mode."""
-    cache_dir = request["cache_dir"]
-    mode = request.get("mode", "remote")
-
-    if mode == "local":
-        folder = request.get("folder")
-        if not folder:
-            raise ValueError("Local mode needs a folder path")
-        report("Scanning %s..." % folder)
-        index = repo.index_local_folder(folder, cache_dir=cache_dir,
-                                        cancel=_cancel_probe(request["job_dir"]))
-    else:
-        enabled = request.get("enabled_sources") or []
-        _install_url_overrides(repo, request.get("url_overrides"))
-        index = repo.download_sources(enabled, progress_callback=report,
-                                      cancel=_cancel_probe(request["job_dir"]),
-                                      cache_dir=cache_dir)
-
-    return index
+def _run(repo, request, report, outcome):
+    """Download the enabled remote sources and publish the index."""
+    enabled = request.get("enabled_sources") or []
+    _install_url_overrides(repo, request.get("url_overrides"))
+    return repo.download_sources(enabled, progress_callback=report,
+                                 cancel=_cancel_probe(request["job_dir"]),
+                                 cache_dir=request["cache_dir"], outcome=outcome)
 
 
 def _result(mode, status, index=None, error=None, details=None):
@@ -195,12 +182,25 @@ def main(argv):
         if config_home:
             repo._config_home = lambda: config_home
 
-        index = _run(repo, request, report)
-        payload = _result(mode, "ok", index)
+        outcome = {}
+        index = _run(repo, request, report, outcome)
+        refreshed = outcome.get("refreshed") or []
+        failed = outcome.get("failed") or {}
+        # Every requested source failing is an error, even though the index of
+        # previously cached palettes was rebuilt; some failing is "partial".
+        status = "ok"
+        if failed:
+            status = "partial" if refreshed else "error"
+        error = None
+        if failed:
+            error = "; ".join("%s: %s" % (name, msg) for name, msg in failed.items())
+        payload = _result(mode, status, index, error=error)
+        payload["refreshed"] = refreshed
+        payload["failed"] = failed
         payload["duration"] = round(time.time() - started, 3)
         report("Finished: %d themes." % payload["count"])
         _write_json(os.path.join(job_dir, RESULT_FILE), payload)
-        return EXIT_OK
+        return EXIT_ERROR if status == "error" else EXIT_OK
     except Exception as ex:
         # A cancellation is an expected, clean outcome: the repo transaction
         # has already rolled back, so nothing was published.

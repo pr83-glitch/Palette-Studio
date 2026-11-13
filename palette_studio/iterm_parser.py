@@ -52,7 +52,7 @@ from pathlib import Path
 # =========================================================================
 
 def _hex_to_rgb(hexstr):
-    """Convert '#RRGGBB', 'RRGGBB' (or short '#RGB') to (r, g, b) floats 0-1.
+    """Convert '#RRGGBB', 'RRGGBB', '#RGB' or '#RRGGBBAA' to (r, g, b) floats 0-1.
 
     Tolerant of surrounding whitespace, a leading '#' anywhere, and trailing
     inline comments. Short 3/4-digit hex forms (used by some terminal themes)
@@ -73,8 +73,12 @@ def _hex_to_rgb(hexstr):
             h = h[:idx]
     h = h.strip()
 
+    # CSS order: '#RGBA' / '#RRGGBBAA' carry alpha last; the theme colour is
+    # the RGB part (alpha is not a terminal palette concept).
     if len(h) in (3, 4):
         h = ''.join(ch * 2 for ch in h[:3])
+    elif len(h) == 8:
+        h = h[:6]
 
     if len(h) != 6:
         return None
@@ -1064,10 +1068,3 @@ def scan_folder_detailed(folder_path):
     _scan_dir(folder)
     themes.sort(key=lambda t: t["name"].lower())
     return themes
-
-
-def scan_folder(folder_path):
-    """
-    Scan a folder for supported theme files and return (name, path) tuples.
-    """
-    return [(t["name"], t["path"]) for t in scan_folder_detailed(folder_path)]

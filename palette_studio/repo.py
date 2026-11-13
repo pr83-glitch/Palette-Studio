@@ -17,9 +17,9 @@
 """
 Repository management for downloading and caching color scheme repos.
 
-Supports five remote sources and one local source:
-  - NvChad base46                   ~105 .lua   (on by default)
-  - iTerm2-Color-Schemes            ~250 .itermcolors
+Supports six sources:
+  - NvChad base46                   ~105 .lua
+  - iTerm2-Color-Schemes            ~250 .itermcolors (on by default)
   - tinted-theming base24           ~230 .yaml
   - kovidgoyal kitty-themes         ~412 .conf
   - alacritty/alacritty-theme       ~177 .toml
@@ -31,10 +31,8 @@ subdirectories. The index is always built from every cached source (a
 superset), so the per-source toggles in preferences only hide/show
 themes without forcing a re-download.
 
-The same-named themes from different sources are all indexed; the
-browser distinguishes them with a per-row source tag. iTerm2 .itermcolors,
-Gogh .yml, kitty .conf, Alacritty .toml, base16/base24 .yaml, base46 .lua and
-Noctalia .json files can also be loaded from a local folder.
+The same-named themes from different sources are all indexed (each entry
+keeps its source tag).
 
 Sources are pinned to reviewed upstream commits (see SOURCES) so a
 download always fetches a known, reproducible snapshot. To update a
@@ -70,7 +68,26 @@ _MAX_ARCHIVE_ENTRIES = 100000
 _MAX_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_THEME_FILE_BYTES = 8 * 1024 * 1024
 _DOWNLOAD_CHUNK = 256 * 1024
-_USER_AGENT = "PaletteStudio/1.2.1 (Blender add-on)"
+
+
+def _manifest_version():
+    """The extension version, read once from ``blender_manifest.toml``.
+
+    Single source of truth for the HTTP user agent and the panel footer, so a
+    version bump only ever touches the manifest. Works in the worker process
+    too (no ``bpy`` needed).
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_manifest.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            return str(tomllib.load(handle).get("version") or "unknown")
+    except Exception:
+        return "unknown"
+
+
+VERSION = _manifest_version()
+_USER_AGENT = "PaletteStudio/%s (Blender add-on)" % VERSION
 
 # Local Noctalia schemes and the community-palettes download are ONE source in
 # the UI ("Noctalia"), so both are indexed under this tag and a single Settings
@@ -206,27 +223,17 @@ def migrate_legacy_cache():
     return False
 
 
-# LOCAL and REMOTE keep separate index files so switching the source mode can
-# never overwrite the other mode's snapshot. The remote filename is unchanged,
-# so an existing cache keeps loading exactly as before.
-INDEX_REMOTE = "remote"
-INDEX_LOCAL = "local"
+INDEX_FILENAME = "theme_index.json"
 
 
-def _index_filename(mode):
-    """Index filename for a mode; the legacy name stays the remote one."""
-    return "theme_index.json" if mode == INDEX_REMOTE else "theme_index_local.json"
+def get_index_path():
+    """Get the index JSON file path."""
+    return os.path.join(get_cache_dir(), INDEX_FILENAME)
 
 
-def get_index_path(mode=INDEX_REMOTE):
-    """Get the index JSON file path for a mode (remote by default)."""
-    return os.path.join(get_cache_dir(), _index_filename(mode))
-
-
-def _index_path(cache_dir=None, mode=INDEX_REMOTE):
+def _index_path(cache_dir=None):
     """Index path for an explicit cache directory, else the resolved one."""
-    filename = _index_filename(mode)
-    return os.path.join(cache_dir, filename) if cache_dir else get_index_path(mode)
+    return os.path.join(cache_dir, INDEX_FILENAME) if cache_dir else get_index_path()
 
 
 def _validate_index(data):
@@ -248,28 +255,23 @@ def _validate_index(data):
     return data
 
 
-def load_index(mode=INDEX_REMOTE):
-    """Read one complete validated snapshot; corrupt/missing caches are empty.
-
-    ``mode`` selects LOCAL or REMOTE; REMOTE is the default so existing
-    callers keep reading the legacy index file unchanged.
-    """
+def load_index():
+    """Read one complete validated snapshot; corrupt/missing caches are empty."""
     try:
-        with open(_index_path(mode=mode), "r", encoding="utf-8") as f:
+        with open(_index_path(), "r", encoding="utf-8") as f:
             return _validate_index(json.load(f))
     except (OSError, ValueError, TypeError):
         return {"themes": [], "last_updated": 0, "sources": []}
 
 
-def save_index(index_data, cache_dir=None, mode=INDEX_REMOTE):
+def save_index(index_data, cache_dir=None):
     """Validate and atomically replace the index, retaining the old on failure.
 
-    ``cache_dir`` lets a worker thread publish without resolving the cache
+    ``cache_dir`` lets the worker process publish without resolving the cache
     through Blender; when omitted the cache path is looked up as usual.
-    ``mode`` picks the LOCAL or REMOTE index file (REMOTE by default).
     """
     _validate_index(index_data)
-    index_path = _index_path(cache_dir, mode)
+    index_path = _index_path(cache_dir)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(index_path),
@@ -284,10 +286,10 @@ def save_index(index_data, cache_dir=None, mode=INDEX_REMOTE):
             os.remove(temporary)
 
 
-def has_index(mode=INDEX_REMOTE):
+def has_index():
     """True when a saved index exists and still points at real theme files."""
     try:
-        themes = load_index(mode).get("themes", [])
+        themes = load_index().get("themes", [])
     except Exception:
         return False
     if not themes:
@@ -387,18 +389,17 @@ def noctalia_local_themes():
     return entries
 
 
-def _merge_local_noctalia(themes):
+def _merge_local_noctalia(themes, local=None):
     """Add the user's own Noctalia schemes to an index, without duplicates.
 
     The local schemes are the files Noctalia itself reads, so they win over a
     downloaded community copy of the same scheme. Duplicates are matched by
-    name for the ``noctalia`` source and by path otherwise - the latter covers
-    a local folder scan that already found the very same scheme file (e.g. the
-    folder IS ``<config>/noctalia/colorschemes``). The same helper is used by
-    the download path and the local-folder path so both write one identical
-    index.
+    name for the ``noctalia`` source and by path otherwise (the very same
+    scheme file indexed twice). ``local`` is the already-scanned list from
+    :func:`noctalia_local_themes`, so callers parse the files only once.
     """
-    local = noctalia_local_themes()
+    if local is None:
+        local = noctalia_local_themes()
     if not local:
         return list(themes)
     local_names = {e["name"].lower() for e in local}
@@ -494,33 +495,6 @@ def noctalia_sync_source():
     return None
 
 
-def index_local_folder(folder_path, cache_dir=None, cancel=None):
-    """Scan a local folder for supported theme files and build an index."""
-    from .iterm_parser import scan_folder_detailed
-
-    _check_cancel(cancel)
-    themes = scan_folder_detailed(folder_path)
-    _check_cancel(cancel)
-    entries = [
-        {"name": t["name"], "path": t["path"], "source": "local",
-         "dark": t["dark"], "variant": t.get("variant", "")}
-        for t in themes
-    ]
-    # The local Noctalia schemes live outside the chosen folder but are local
-    # files all the same, so they stay listed in LOCAL mode too - and only
-    # once, even when the chosen folder is the Noctalia scheme directory.
-    entries = _merge_local_noctalia(entries)
-    entries.sort(key=lambda t: t["name"].lower())
-    index = {
-        "themes": entries,
-        "last_updated": time.time(),
-        "sources": ["local", NOCTALIA_TAG],
-    }
-    _check_cancel(cancel)
-    save_index(index, cache_dir, INDEX_LOCAL)
-    return index
-
-
 class DownloadCancelled(Exception):
     """Raised when a caller-supplied cancellation signal fires mid-download.
 
@@ -609,8 +583,10 @@ def _extract_theme_files(zip_bytes, cache_subdir, extensions, repo_subdir=None):
     paths can never escape the cache directory. Archive entry count and
     total uncompressed size are capped to reject zip bombs.
     """
-    if os.path.islink(cache_subdir) or os.path.realpath(cache_subdir) != os.path.abspath(cache_subdir):
-        raise ValueError("Extraction directory must not traverse symlinks")
+    # Only the extraction directory itself must not be a link. A symlink
+    # higher up (e.g. a ~/.config managed by a dotfile tool) is legitimate.
+    if os.path.islink(cache_subdir):
+        raise ValueError("Extraction directory must not be a symlink")
     count = 0
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         infos = zf.infolist()
@@ -775,30 +751,6 @@ def _download_and_extract(url, cache_subdir, extensions, repo_subdir=None,
             shutil.rmtree(workspace, ignore_errors=True)
 
 
-def download_repo(repo_url=None, progress_callback=None, cancel=None,
-                  cache_dir=None):
-    """
-    Legacy single-source download. Downloads iTerm2-Color-Schemes.
-    Returns the index data dict.
-    """
-    if repo_url is None:
-        repo_url = _source_url(SOURCES["iterm"])
-
-    cache_dir = cache_dir or get_cache_dir()
-    schemes_dir = os.path.join(cache_dir, "schemes")
-
-    with _source_transaction() as transaction:
-        count = _download_and_extract(
-            repo_url, schemes_dir, {".itermcolors"},
-            repo_subdir="schemes", progress_callback=progress_callback,
-            transaction=transaction, cancel=cancel,
-        )
-        if progress_callback:
-            progress_callback(f"Extracted {count} themes.")
-        _check_cancel(cancel)
-        return index_local_folder(schemes_dir, cache_dir=cache_dir)
-
-
 def _scan_sources(cache_dir, source_keys):
     """Scan cached source directories and build a unified index dict.
 
@@ -848,7 +800,7 @@ def _scan_sources(cache_dir, source_keys):
     # downloaded community collection it is listed ONCE, from the local file:
     # that is the copy Noctalia is using, and the one Sync reads.
     local_noctalia = noctalia_local_themes()
-    all_themes = _merge_local_noctalia(all_themes)
+    all_themes = _merge_local_noctalia(all_themes, local_noctalia)
     if local_noctalia and NOCTALIA_TAG not in sources_done:
         sources_done.append(NOCTALIA_TAG)
 
@@ -879,7 +831,7 @@ def _cached_source_keys(cache_dir):
 
 
 def download_sources(enabled_sources, progress_callback=None, cancel=None,
-                     cache_dir=None):
+                     cache_dir=None, outcome=None):
     """
     Download multiple sources and build a unified, deduplicated index.
 
@@ -895,6 +847,9 @@ def download_sources(enabled_sources, progress_callback=None, cancel=None,
         cancel: optional ``threading.Event``-like object (``is_set()``) or
             zero-argument callable; while it is unset the call is unchanged
         cache_dir: explicit cache directory (main-thread resolved)
+        outcome: optional dict filled with ``refreshed`` (source names that
+            downloaded) and ``failed`` ({source name: error}) so callers can
+            tell a full refresh from a partial or completely failed one
 
     Returns the combined index data dict. Raises :class:`DownloadCancelled`
     without publishing anything (no index write, old snapshots restored) when
@@ -902,6 +857,10 @@ def download_sources(enabled_sources, progress_callback=None, cancel=None,
     """
     cache_dir = cache_dir or get_cache_dir()
     sources_done = []
+    failed = {}
+    if outcome is not None:
+        outcome["refreshed"] = []
+        outcome["failed"] = failed
 
     # UI tags are not always remote source keys: Noctalia's single toggle
     # includes both the local schemes and the community download.
@@ -927,11 +886,14 @@ def download_sources(enabled_sources, progress_callback=None, cancel=None,
                 if progress_callback:
                     progress_callback(f"{src['name']}: {count} themes extracted.")
                 sources_done.append(source_key)
+                if outcome is not None:
+                    outcome["refreshed"].append(src["name"])
             except DownloadCancelled:
                 # Never swallow a cancellation as a per-source warning: the
                 # transaction rolls every published source back.
                 raise
             except Exception as e:
+                failed[src["name"]] = str(e) or type(e).__name__
                 if progress_callback:
                     progress_callback(f"Warning: {src['name']} failed: {e}")
                 continue
@@ -942,7 +904,7 @@ def download_sources(enabled_sources, progress_callback=None, cancel=None,
         cached = _cached_source_keys(cache_dir)
         index = _scan_sources(cache_dir, cached)
         _check_cancel(cancel)
-        save_index(index, cache_dir, INDEX_REMOTE)
+        save_index(index, cache_dir)
 
     if progress_callback:
         tags = {SOURCES[key].get("tag", key) for key in selected if key in SOURCES}
@@ -955,30 +917,17 @@ def download_sources(enabled_sources, progress_callback=None, cancel=None,
     return index
 
 
-def get_theme_list(mode=INDEX_REMOTE):
-    """Get the current list of themes from the mode's index (remote default)."""
-    index = load_index(mode)
+def get_theme_list():
+    """Get the current list of themes from the saved index."""
+    index = load_index()
     return index.get("themes", [])
 
 
-def rebuild_remote_index(cache_dir=None):
-    """Rebuild the remote index from already-cached sources, without downloading.
-
-    Used when the browser switches back to REMOTE mode: the cached source
-    directories are re-scanned so the snapshot matches what is on disk. No
-    network access, so it is safe offline and from a preference callback.
-    """
-    cache_dir = cache_dir or get_cache_dir()
-    index = _scan_sources(cache_dir, _cached_source_keys(cache_dir))
-    save_index(index, cache_dir, INDEX_REMOTE)
-    return index
-
-
-def ensure_index_flags(mode=INDEX_REMOTE):
+def ensure_index_flags():
     """Backfill per-theme metadata (dark flag) on indexes written by older
     versions, then persist. No-op once every entry carries the flag."""
     try:
-        index = load_index(mode)
+        index = load_index()
     except Exception:
         return
 
@@ -993,7 +942,7 @@ def ensure_index_flags(mode=INDEX_REMOTE):
             t["dark"] = is_dark_file(t.get("path", ""))
 
     try:
-        save_index(index, mode=mode)
+        save_index(index)
     except Exception:
         pass
 

@@ -437,13 +437,3 @@ def resolve(theme, role_map=None):
 def resolve_collection_colors(theme):
     """Return the 8 Collection Color tag colours as exact palette colours."""
     return [resolve_slot(theme, slot) for slot in COLLECTION_SLOTS]
-
-
-def table_text():
-    """Return the full role -> slot table as plain text (debugging/finetune)."""
-    lines = ["%-28s %s" % (role, spec if not isinstance(spec, (tuple, list))
-                           else "%s alpha=%g" % spec)
-             for role, spec in ROLE_MAP.items()]
-    lines += ["", "%-28s %s" % ("collection_colors", ", ".join(COLLECTION_SLOTS))]
-    lines += ["%-28s %s" % ("node_*", ", ".join(NODE_SLOTS.values()))]
-    return "\n".join(lines)

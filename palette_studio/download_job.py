@@ -47,12 +47,14 @@ here survives an add-on disable/enable cycle.
 
 Everything a job owns lives in ``<cache_dir>/.palette-download-jobs/<id>/``:
 the request, the child's stdout/stderr log, the progress log and the result.
-Those directories are deliberately **retained** (never deleted here) so a
-failed run can be inspected; Unload removes the whole cache as usual.
+The newest few job directories are retained so a failed run can be
+inspected; older ones are pruned when the next job starts, and Unload removes
+the whole cache as usual.
 """
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -68,6 +70,9 @@ REQUEST_FILE = "request.json"
 WORKER_LOG = "worker.log"
 
 JOB_ROOT = ".palette-download-jobs"
+# Older job folders (logs of finished runs) beyond this many are removed when a
+# new job starts, so the cache does not grow with every download.
+_KEEP_JOBS = 5
 _POLL_INTERVAL = 0.3
 _MAX_PROGRESS_READ = 64 * 1024
 _CANCEL_MARKER = CANCEL_MARKER  # internal alias for brevity below
@@ -181,9 +186,27 @@ def _child_environment(job_dir):
     return environment
 
 
+def _prune_job_dirs(root, keep=_KEEP_JOBS):
+    """Delete all but the newest ``keep`` finished job folders (best effort).
+
+    Only called from ``start`` once ``is_running`` is False, so no live child
+    owns any of these folders. Names start with a sortable timestamp.
+    """
+    try:
+        names = sorted(
+            name for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+            and not os.path.islink(os.path.join(root, name)))
+    except OSError:
+        return
+    for name in names[:max(0, len(names) - keep)]:
+        shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
 def _new_job_dir(cache_dir):
     root = os.path.join(cache_dir, JOB_ROOT)
     os.makedirs(root, exist_ok=True)
+    _prune_job_dirs(root, _KEEP_JOBS - 1)
     job_dir = os.path.join(root, time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
     os.makedirs(job_dir, exist_ok=True)
     return job_dir
@@ -297,7 +320,7 @@ def result():
 
 
 def mode():
-    """The mode of the current or most recent job ('remote'/'local')."""
+    """The mode of the current or most recent job (always 'remote')."""
     return _state.get("mode")
 
 
@@ -306,7 +329,7 @@ def job_dir():
     return _state.get("job_dir")
 
 
-def start(mode, cache_dir=None, folder=None, enabled_sources=None,
+def start(mode, cache_dir=None, enabled_sources=None,
           extension_dir=None, binary=None, blender=True, on_finished=None,
           use_timer=True, url_overrides=None, scan_env=None, first_interval=None):
     """Launch the worker in a separate process and begin polling it.
@@ -326,7 +349,6 @@ def start(mode, cache_dir=None, folder=None, enabled_sources=None,
         "cache_dir": os.path.abspath(cache_dir),
         "job_dir": job_dir,
         "mode": mode,
-        "folder": folder,
         "enabled_sources": list(enabled_sources or []),
         "url_overrides": dict(url_overrides or {}),
         "scan_env": scan_env if scan_env is not None else _user_scan_env(),
@@ -357,8 +379,7 @@ def start(mode, cache_dir=None, folder=None, enabled_sources=None,
         "mode": mode,
         "request": request,
         "status": "running",
-        "message": ("Scanning local palettes..." if mode == "local"
-                    else "Downloading palettes..."),
+        "message": "Downloading palettes...",
         "started": time.time(),
         "on_finished": on_finished,
     })
@@ -468,11 +489,18 @@ def _read_result(job):
     return data if isinstance(data, dict) else None
 
 
-def _outcome_message(outcome, count, error):
+def _outcome_message(outcome, count, error, failed=None):
+    plural = "" if count == 1 else "s"
     if outcome == "ok":
-        return "Updated %d palette%s." % (count, "" if count == 1 else "s")
+        return "Updated %d palette%s." % (count, plural)
+    if outcome == "partial":
+        names = ", ".join(sorted(failed or {})) or "some sources"
+        return "Updated %d palette%s, but %s failed." % (count, plural, names)
     if outcome == "cancelled":
         return "Cancelled. Nothing was changed."
+    if failed:
+        return "Download failed (%s). Your cached palettes are unchanged." % (
+            ", ".join(sorted(failed)))
     return "Failed: %s" % (error or "unknown error")
 
 
@@ -509,7 +537,8 @@ def _finalize(job, error=None):
     outcome = payload.get("status", "error")
     job["result"] = payload
     job["status"] = outcome
-    job["message"] = _outcome_message(outcome, payload.get("count", 0), payload.get("error"))
+    job["message"] = _outcome_message(outcome, payload.get("count", 0), payload.get("error"),
+                                      payload.get("failed"))
     job["process"] = None
     job["monitored"] = False
     _close_log(job)
